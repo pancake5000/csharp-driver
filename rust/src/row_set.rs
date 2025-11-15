@@ -1,8 +1,12 @@
 use scylla::client::pager::QueryPager;
+use scylla::cluster::metadata::CollectionType;
 use scylla::errors::DeserializationError;
+use scylla::frame::response::result::{ColumnType, NativeType};
 
 use crate::FfiPtr;
-use crate::ffi::{ArcFFI, BridgedBorrowedSharedPtr, BridgedOwnedSharedPtr, FFI, FromArc};
+use crate::ffi::{
+    ArcFFI, BridgedBorrowedSharedPtr, BridgedOwnedSharedPtr, FFI, FromArc, FromRef, RefFFI,
+};
 use crate::task::BridgedFuture;
 
 #[derive(Debug)]
@@ -24,10 +28,117 @@ impl FFI for RowSet {
     type Origin = FromArc;
 }
 
+impl FFI for ColumnType<'_> {
+    type Origin = FromRef;
+}
+
 #[unsafe(no_mangle)]
 pub extern "C" fn row_set_free(row_set_ptr: BridgedOwnedSharedPtr<RowSet>) {
     ArcFFI::free(row_set_ptr);
     tracing::trace!("[FFI] RowSet freed");
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn row_set_get_columns_count(
+    row_set_ptr: BridgedBorrowedSharedPtr<'_, RowSet>,
+) -> usize {
+    let row_set = ArcFFI::as_ref(row_set_ptr).unwrap();
+    let pager = row_set.pager.lock().unwrap();
+    pager.column_specs().len()
+}
+
+// TODO: Add specific lifetime parameter to ColumnType
+// Compiler does not recognize that pager outlives the BridgedBorrowedSharedPtr
+type SetMetadata = unsafe extern "C" fn(
+    columns_ptr: ColumnsPtr,
+    value_index: usize,
+    name_ptr: *const u8,
+    name_len: usize,
+    keyspace_ptr: *const u8,
+    keyspace_len: usize,
+    table_ptr: *const u8,
+    table_len: usize,
+    type_code: usize,
+    type_info_handle: BridgedBorrowedSharedPtr<'_, ColumnType<'_>>,
+    is_frozen: i32,
+);
+
+/// Calls back into C# for each column to provide metadata.
+/// `metadata_setter` is a function pointer supplied by C# - it will be called synchronously for each column.
+/// SAFETY: This function assumes that `columns_ptr` is a valid pointer
+/// to a C# CQLColumn array of length equal to the number of columns,
+/// and that `set_metadata` is a valid function pointer that can be called safely.
+#[unsafe(no_mangle)]
+pub extern "C" fn row_set_fill_columns_metadata(
+    row_set_ptr: BridgedBorrowedSharedPtr<'_, RowSet>,
+    columns_ptr: ColumnsPtr,
+    set_metadata: SetMetadata,
+) -> i32 {
+    let row_set = ArcFFI::as_ref(row_set_ptr).unwrap();
+    let pager = row_set.pager.lock().unwrap();
+
+    // Iterate column specs and call the metadata setter
+    for (i, spec) in pager.column_specs().iter().enumerate() {
+        fn str_to_ptr_and_len(s: &str) -> (*const u8, usize) {
+            if s.is_empty() {
+                (std::ptr::null(), 0)
+            } else {
+                (s.as_ptr(), s.len())
+            }
+        }
+
+        let name = spec.name();
+        let (name_ptr, name_len) = str_to_ptr_and_len(name);
+
+        let ks = spec.table_spec().ks_name();
+        let (keyspace_ptr, keyspace_len) = str_to_ptr_and_len(ks);
+
+        let table = spec.table_spec().table_name();
+        let (table_ptr, table_len) = str_to_ptr_and_len(table);
+
+        let type_code = column_type_to_code(spec.typ()) as usize;
+
+        let type_info_handle: BridgedBorrowedSharedPtr<ColumnType> = if type_code >= 0x00020 {
+            RefFFI::as_ptr(spec.typ())
+        } else {
+            RefFFI::null()
+        };
+
+        let is_frozen = match spec.typ() {
+            ColumnType::Collection { frozen, .. } => {
+                if *frozen {
+                    1
+                } else {
+                    0
+                }
+            }
+            ColumnType::UserDefinedType { frozen, .. } => {
+                if *frozen {
+                    1
+                } else {
+                    0
+                }
+            }
+            _ => 0,
+        };
+
+        unsafe {
+            set_metadata(
+                columns_ptr,
+                i,
+                name_ptr,
+                name_len,
+                keyspace_ptr,
+                keyspace_len,
+                table_ptr,
+                table_len,
+                type_code,
+                type_info_handle,
+                is_frozen,
+            );
+        }
+    }
+    pager.column_specs().len() as i32
 }
 
 #[derive(Clone, Copy)]
@@ -118,4 +229,272 @@ pub extern "C" fn row_set_next_row<'row_set>(
     // This is inherently inefficient, but necessary due to blocking C# API upon page boundaries.
     // TODO: implement async C# API (IAsyncEnumerable) to avoid this.
     BridgedFuture::block_on(deserialize_fut) as i32
+}
+
+// TODO: Below change all unwrap() to unwrap_or_else() with proper error handling
+
+#[unsafe(no_mangle)]
+pub extern "C" fn row_set_type_info_get_code(
+    type_info_handle: BridgedBorrowedSharedPtr<ColumnType<'_>>,
+) -> usize {
+    if type_info_handle.is_null() {
+        return 0;
+    }
+
+    let type_info = RefFFI::as_ref(type_info_handle).unwrap();
+    column_type_to_code(type_info) as usize
+}
+
+// Specific child accessors
+
+#[unsafe(no_mangle)]
+pub extern "C" fn row_set_type_info_get_list_child<'typ>(
+    type_info_handle: BridgedBorrowedSharedPtr<'typ, ColumnType<'typ>>,
+    out_child_handle: *mut BridgedBorrowedSharedPtr<'typ, ColumnType<'typ>>,
+    out_is_frozen: *mut i32,
+) -> i32 {
+    if type_info_handle.is_null() {
+        return 0;
+    }
+
+    let type_info = RefFFI::as_ref(type_info_handle).unwrap();
+    match type_info {
+        ColumnType::Collection {
+            typ: CollectionType::List(inner),
+            frozen,
+        } => {
+            if out_child_handle.is_null() {
+                return 0;
+            }
+            let child = inner.as_ref();
+            unsafe {
+                out_child_handle.write(RefFFI::as_ptr(child));
+                out_is_frozen.write(if *frozen { 1 } else { 0 });
+            }
+            1
+        }
+        _ => 0,
+    }
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn row_set_type_info_get_set_child<'typ>(
+    type_info_handle: BridgedBorrowedSharedPtr<'typ, ColumnType<'typ>>,
+    out_child_handle: *mut BridgedBorrowedSharedPtr<'typ, ColumnType<'typ>>,
+) -> i32 {
+    if type_info_handle.is_null() {
+        return 0;
+    }
+
+    let type_info = RefFFI::as_ref(type_info_handle).unwrap();
+    match type_info {
+        ColumnType::Collection {
+            typ: CollectionType::Set(inner),
+            ..
+        } => {
+            if out_child_handle.is_null() {
+                return 0;
+            }
+            let child = inner.as_ref();
+            unsafe {
+                out_child_handle.write(RefFFI::as_ptr(child));
+            }
+            1
+        }
+        _ => 0,
+    }
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn row_set_type_info_get_map_children<'typ>(
+    type_info_handle: BridgedBorrowedSharedPtr<'typ, ColumnType<'typ>>,
+    out_key_handle: *mut BridgedBorrowedSharedPtr<'typ, ColumnType<'typ>>,
+    out_value_handle: *mut BridgedBorrowedSharedPtr<'typ, ColumnType<'typ>>,
+) -> i32 {
+    if type_info_handle.is_null() {
+        return 0;
+    }
+
+    let type_info = RefFFI::as_ref(type_info_handle).unwrap();
+    match type_info {
+        ColumnType::Collection {
+            typ: CollectionType::Map(key, value),
+            ..
+        } => {
+            if out_key_handle.is_null() || out_value_handle.is_null() {
+                return 0;
+            }
+            let key_child = key.as_ref();
+            let value_child = value.as_ref();
+            let k_ptr = RefFFI::as_ptr(key_child);
+            let v_ptr = RefFFI::as_ptr(value_child);
+            unsafe {
+                *out_key_handle = k_ptr;
+                *out_value_handle = v_ptr;
+            }
+            1
+        }
+        _ => 0,
+    }
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn row_set_type_info_get_tuple_field_count(
+    type_info_handle: BridgedBorrowedSharedPtr<'_, ColumnType<'_>>,
+) -> usize {
+    if type_info_handle.is_null() {
+        return 0;
+    }
+
+    let type_info = RefFFI::as_ref(type_info_handle).unwrap();
+    match type_info {
+        ColumnType::Tuple(fields) => fields.len(),
+        _ => 0,
+    }
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn row_set_type_info_get_tuple_field<'typ>(
+    type_info_handle: BridgedBorrowedSharedPtr<'typ, ColumnType<'typ>>,
+    index: usize,
+    out_field_handle: *mut BridgedBorrowedSharedPtr<'typ, ColumnType<'typ>>,
+) -> i32 {
+    if type_info_handle.is_null() {
+        return 0;
+    }
+
+    let type_info = RefFFI::as_ref(type_info_handle).unwrap();
+    match type_info {
+        ColumnType::Tuple(fields) => {
+            if out_field_handle.is_null() {
+                return 0;
+            }
+            let Some(field) = fields.get(index) else {
+                return 0;
+            };
+            let ptr = RefFFI::as_ptr(field);
+            unsafe {
+                *out_field_handle = ptr;
+            }
+            1
+        }
+        _ => 0,
+    }
+}
+
+// --- UDT accessors ---
+
+#[unsafe(no_mangle)]
+pub extern "C" fn row_set_type_info_get_udt_name(
+    type_info_handle: BridgedBorrowedSharedPtr<'_, ColumnType<'_>>,
+    out_name_ptr: *mut *const u8,
+    out_name_len: *mut usize,
+    out_keyspace_ptr: *mut *const u8,
+    out_keyspace_len: *mut usize,
+) -> i32 {
+    if type_info_handle.is_null() {
+        return 0;
+    }
+
+    let type_info = RefFFI::as_ref(type_info_handle).unwrap();
+    match type_info {
+        ColumnType::UserDefinedType { definition, .. } => {
+            let name = definition.name.as_ref();
+            let ks = definition.keyspace.as_ref();
+            unsafe { *out_name_ptr = name.as_ptr() };
+            unsafe { *out_name_len = name.len() };
+            unsafe { *out_keyspace_ptr = ks.as_ptr() };
+            unsafe { *out_keyspace_len = ks.len() };
+            1
+        }
+        _ => 0,
+    }
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn row_set_type_info_get_udt_field_count(
+    type_info_handle: BridgedBorrowedSharedPtr<ColumnType<'_>>,
+) -> usize {
+    if type_info_handle.is_null() {
+        return 0;
+    }
+
+    let type_info = RefFFI::as_ref(type_info_handle).unwrap();
+    match type_info {
+        ColumnType::UserDefinedType { definition, .. } => definition.field_types.len(),
+        _ => 0,
+    }
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn row_set_type_info_get_udt_field<'typ>(
+    type_info_handle: BridgedBorrowedSharedPtr<'typ, ColumnType<'typ>>,
+    index: usize,
+    out_field_name_ptr: *mut *const u8,
+    out_field_name_len: *mut usize,
+    out_field_type_handle: *mut BridgedBorrowedSharedPtr<'typ, ColumnType<'typ>>,
+) -> i32 {
+    if type_info_handle.is_null() {
+        return 0;
+    }
+
+    let type_info = RefFFI::as_ref(type_info_handle).unwrap();
+    match type_info {
+        ColumnType::UserDefinedType { definition, .. } => {
+            if out_field_type_handle.is_null() {
+                return 0;
+            }
+            let Some((field_name, field_type)) = definition.field_types.get(index) else {
+                return 0;
+            };
+            unsafe { *out_field_name_ptr = field_name.as_ptr() };
+            unsafe { *out_field_name_len = field_name.len() };
+
+            let child = field_type;
+            let ptr = RefFFI::as_ptr(child);
+            unsafe {
+                *out_field_type_handle = ptr;
+            }
+            1
+        }
+        _ => 0,
+    }
+}
+
+fn column_type_to_code(typ: &ColumnType) -> u16 {
+    match typ {
+        ColumnType::Native(nt) => match nt {
+            NativeType::Ascii => 0x0001,
+            NativeType::BigInt => 0x0002,
+            NativeType::Blob => 0x0003,
+            NativeType::Boolean => 0x0004,
+            NativeType::Counter => 0x0005,
+            NativeType::Decimal => 0x0006,
+            NativeType::Double => 0x0007,
+            NativeType::Float => 0x0008,
+            NativeType::Int => 0x0009,
+            NativeType::Text => 0x000A,
+            NativeType::Timestamp => 0x000B,
+            NativeType::Uuid => 0x000C,
+            NativeType::Varint => 0x000E,
+            NativeType::Timeuuid => 0x000F,
+            NativeType::Inet => 0x0010,
+            NativeType::Date => 0x0011,
+            NativeType::Time => 0x0012,
+            NativeType::SmallInt => 0x0013,
+            NativeType::TinyInt => 0x0014,
+            NativeType::Duration => 0x0015,
+            _ => 0x0000,
+        },
+        ColumnType::Collection { typ, .. } => match typ {
+            CollectionType::List { .. } => 0x0020,
+            CollectionType::Map { .. } => 0x0021,
+            CollectionType::Set { .. } => 0x0022,
+            _ => 0x0000,
+        },
+        ColumnType::Vector { .. } => 0x0020, // FIXME: handle Vector as custom type
+        ColumnType::UserDefinedType { .. } => 0x0030,
+        ColumnType::Tuple(_) => 0x0031,
+        _ => 0x0000,
+    }
 }
