@@ -44,7 +44,7 @@ jobs:
         with:
           dotnet-version: '9.0.x'
 
-      - name: Run dotnet format (checks formatting)
+      - name: Run static checks (checks formatting, linting and performs code analysis)
         run: make check
 
       - name: Copy development signing key
