@@ -129,6 +129,16 @@ namespace Cassandra
             Info = new ExecutionInfo();
         }
 
+        /// <summary>
+        /// Creates a new instance of RowSet.
+        /// </summary>
+        public RowSet() : base(IntPtr.Zero, true)
+        {
+            Info = new ExecutionInfo();
+            Columns = new CqlColumn[0];
+            AutoPage = true;
+        }
+
         private static CqlColumn[] ExtractColumnsFromRust(IntPtr rowSetPtr)
         {
             var columns = new CqlColumn[1]; // FIXME: bridge with Rust.
