@@ -107,7 +107,7 @@ namespace Cassandra
             _routingKey = statement.RoutingKey;
             _keyspace = statement.Keyspace ?? statement.Variables?.Keyspace;
             _table = statement.Variables?.Table;
-
+            
             SetConsistencyLevel(statement.ConsistencyLevel);
             if (statement.IsIdempotent != null)
             {
@@ -297,6 +297,11 @@ namespace Cassandra
         public override string ToString()
         {
             return _preparedStatement?.ToString();
+        }
+
+        public IntPtr RustPreparedStatement()
+        {
+            return _preparedStatement.RustPreparedStatement;
         }
     }
 }

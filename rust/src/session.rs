@@ -84,3 +84,24 @@ pub extern "C" fn session_query(
         })
     })
 }
+
+#[unsafe(no_mangle)]
+pub extern "C" fn session_bounded_query(
+    tcb: Tcb,
+    session_ptr: BridgedBorrowedSharedPtr<'_, BridgedSession>,
+    prepared_statement_ptr: BridgedOwnedSharedPtr<BridgedPreparedStatement>,
+) {
+    let bridged_session = ArcFFI::cloned_from_ptr(session_ptr).unwrap();
+    let bridged_prepared_statement = ArcFFI::cloned_from_ptr(prepared_statement_ptr).unwrap();
+    
+    BridgedFuture::spawn::<_, _, PagerExecutionError>(tcb, async move {
+        //println!("Executing statement \"{}\"", statement);
+        let query_pager = bridged_session.inner.execute_iter(bridged_prepared_statement.inner.copy(), ()).await?;
+        println!("Statement executed");
+
+        Ok(RowSet {
+            pager: std::sync::Mutex::new(query_pager),
+        })
+    })
+}
+

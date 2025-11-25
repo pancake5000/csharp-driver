@@ -40,6 +40,8 @@ namespace Cassandra
         private string[] _routingNames;
         private volatile int[] _routingIndexes;
         private volatile bool _isLwt;
+        
+        internal IntPtr RustPreparedStatement { get; private set; }
 
         /// <summary>
         /// The cql query
@@ -133,7 +135,7 @@ namespace Cassandra
         internal PreparedStatement(IntPtr preparedStatementPtr, string cql, RowSetMetadata variablesRowsMetadata)
         {
             bool isLwt = prepared_statement_is_lwt(preparedStatementPtr) != 0;
-
+            rustPreparedStatement = preparedStatementPtr;
             _variablesRowsMetadata = variablesRowsMetadata;
             Cql = cql;
             _isLwt = isLwt;
