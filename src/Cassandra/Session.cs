@@ -55,6 +55,9 @@ namespace Cassandra
         [DllImport("csharp_wrapper", CallingConvention = CallingConvention.Cdecl)]
         unsafe private static extern void session_prepare(Tcb tcb, IntPtr session, [MarshalAs(UnmanagedType.LPUTF8Str)] string statement);
 
+        [DllImport("csharp_wrapper", CallingConvention = CallingConvention.Cdecl)]
+        unsafe private static extern void session_execute_bound(Tcb tcb, IntPtr session, IntPtr preparedStatement);
+
         private static readonly Logger Logger = new Logger(typeof(Session));
         private readonly ICluster _cluster;
         private int _disposed;
@@ -345,15 +348,22 @@ namespace Cassandra
                     }, TaskContinuationOptions.ExecuteSynchronously);
 
                 case BoundStatement bs:
-                    if (bs.QueryValues.Length == 0)
-                    {
-                        throw new NotImplementedException("Bound statements without values are not yet supported");
-                    }
-                    else
+                    // Only support bound statements without values for now
+                    if (bs.QueryValues.Length > 0)
                     {
                         throw new NotImplementedException("Bound statements with values are not yet supported");
                     }
-                // break;
+
+                    TaskCompletionSource<IntPtr> boundTcs = new(TaskCreationOptions.RunContinuationsAsynchronously);
+                    Tcb boundTcb = Tcb.WithTcs(boundTcs);
+
+                    session_execute_bound(boundTcb, handle, bs.PreparedStatement.DangerousGetHandle());
+
+                    return boundTcs.Task.ContinueWith(t =>
+                    {
+                        IntPtr rowSetPtr = t.Result;
+                        return new RowSet(rowSetPtr);
+                    }, TaskContinuationOptions.ExecuteSynchronously);
 
                 case BatchStatement s:
                     throw new NotImplementedException("Batches are not yet supported");

@@ -91,6 +91,32 @@ pub extern "C" fn session_query(
 }
 
 #[unsafe(no_mangle)]
+pub extern "C" fn session_execute_bound(
+    tcb: Tcb,
+    session_ptr: BridgedBorrowedSharedPtr<'_, BridgedSession>,
+    prepared_statement_ptr: BridgedBorrowedSharedPtr<'_, BridgedPreparedStatement>,
+) {
+    let bridged_prepared = ArcFFI::cloned_from_ptr(prepared_statement_ptr).unwrap();
+    let bridged_session = ArcFFI::cloned_from_ptr(session_ptr).unwrap();
+
+    tracing::trace!("[FFI] Scheduling prepared statement execution");
+
+    BridgedFuture::spawn::<_, _, PagerExecutionError>(tcb, async move {
+        tracing::debug!("[FFI] Executing prepared statement");
+
+        let query_pager = bridged_session
+            .inner
+            .execute_iter(bridged_prepared.inner.clone(), ())
+            .await?;
+        tracing::trace!("[FFI] Prepared statement executed");
+
+        Ok(RowSet {
+            pager: std::sync::Mutex::new(query_pager),
+        })
+    })
+}
+
+#[unsafe(no_mangle)]
 pub extern "C" fn session_use_keyspace(
     tcb: Tcb,
     session_ptr: BridgedBorrowedSharedPtr<'_, BridgedSession>,

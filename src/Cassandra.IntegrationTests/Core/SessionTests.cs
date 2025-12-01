@@ -90,27 +90,27 @@ namespace Cassandra.IntegrationTests.Core
             });
         }
 
-        // [Test]
-        // public void Session_Execute_Logging_With_Verbose_Level_Test()
-        // {
-        //     var originalLevel = Diagnostics.CassandraTraceSwitch.Level;
-        //     Diagnostics.CassandraTraceSwitch.Level = TraceLevel.Verbose;
-        //     try
-        //     {
-        //         Assert.DoesNotThrow(() =>
-        //         {
-        //             using (var localCluster = ClusterBuilder().AddContactPoint(TestCluster.InitialContactPoint).Build())
-        //             {
-        //                 var localSession = localCluster.Connect("system");
-        //                 var ps = localSession.Prepare("SELECT * FROM local");
-        //                 TestHelper.ParallelInvoke(() => localSession.Execute(ps.Bind()), 100);
-        //             }
-        //         });
-        //     }
-        //     finally
-        //     {
-        //         Diagnostics.CassandraTraceSwitch.Level = originalLevel;
-        //     }
-        // }
+        [Test]
+        public void Session_Execute_Logging_With_Verbose_Level_Test()
+        {
+            var originalLevel = Diagnostics.CassandraTraceSwitch.Level;
+            Diagnostics.CassandraTraceSwitch.Level = TraceLevel.Verbose;
+            try
+            {
+                Assert.DoesNotThrow(() =>
+                {
+                    using (var localCluster = ClusterBuilder().AddContactPoint(TestCluster.InitialContactPoint).Build())
+                    {
+                        var localSession = localCluster.Connect("system");
+                        var ps = localSession.Prepare("SELECT * FROM local");
+                        TestHelper.ParallelInvoke(() => localSession.Execute(ps.Bind()), 100);
+                    }
+                });
+            }
+            finally
+            {
+                Diagnostics.CassandraTraceSwitch.Level = originalLevel;
+            }
+        }
     }
 }
