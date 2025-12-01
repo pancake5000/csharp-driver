@@ -85,7 +85,7 @@ pub extern "C" fn session_query(
         tracing::trace!("[FFI] Statement executed");
 
         Ok(RowSet {
-            pager: std::sync::Mutex::new(query_pager),
+            pager: std::sync::Mutex::new(Some(query_pager)),
         })
     })
 }
@@ -111,7 +111,7 @@ pub extern "C" fn session_execute_bound(
         tracing::trace!("[FFI] Prepared statement executed");
 
         Ok(RowSet {
-            pager: std::sync::Mutex::new(query_pager),
+            pager: std::sync::Mutex::new(Some(query_pager)),
         })
     })
 }
@@ -163,18 +163,6 @@ pub extern "C" fn session_use_keyspace(
             })?;
 
         tracing::trace!("[FFI] use_keyspace executed successfully");
-
-        // Return an empty RowSet - query system.local with impossible condition
-        let pager = bridged_session
-            .inner
-            .query_iter(
-                "SELECT * FROM system.local WHERE key = 'impossiblekeyvalue'",
-                (),
-            )
-            .await?;
-
-        Ok(RowSet {
-            pager: std::sync::Mutex::new(pager),
-        })
+        Ok(RowSet::empty())
     })
 }

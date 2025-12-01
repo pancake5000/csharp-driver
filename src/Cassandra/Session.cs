@@ -357,6 +357,11 @@ namespace Cassandra
                     TaskCompletionSource<IntPtr> boundTcs = new(TaskCreationOptions.RunContinuationsAsynchronously);
                     Tcb boundTcb = Tcb.WithTcs(boundTcs);
 
+                    if (bs.PreparedStatement.IsInvalid)
+                    {
+                        throw new InvalidOperationException("The bound statement's prepared statement is invalid.");
+                    }
+
                     session_execute_bound(boundTcb, handle, bs.PreparedStatement.DangerousGetHandle());
 
                     return boundTcs.Task.ContinueWith(t =>
