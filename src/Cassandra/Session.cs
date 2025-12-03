@@ -138,9 +138,18 @@ namespace Cassandra
                 // This will throw InvalidQueryException if keyspace doesn't exist
                 if (!string.IsNullOrEmpty(keyspace))
                 {
-                    // Execute USE directly without checking if keyspace changed
-                    // to validate that the keyspace exists
-                    session.Execute(new SimpleStatement(CqlQueryTools.GetUseKeyspaceCql(keyspace)));
+                    try
+                    {
+                        // Execute USE directly without checking if keyspace changed
+                        // to validate that the keyspace exists
+                        session.Execute(new SimpleStatement(CqlQueryTools.GetUseKeyspaceCql(keyspace)));
+                    }
+                    catch
+                    {
+                        // If validation fails, ensure the native session is freed to avoid leaks
+                        try { session.Dispose(); } catch { }
+                        throw;
+                    }
                 }
 
                 return (ISession)session;
@@ -232,6 +241,10 @@ namespace Cassandra
 
             // FIXME: Actually perform shutdown.
             // Remember to dequeue from Cluster's sessions list.
+
+            // Dispose the session handle which will call session_free in Rust
+            Dispose();
+
             return Task.FromResult<object>(null);
         }
 
