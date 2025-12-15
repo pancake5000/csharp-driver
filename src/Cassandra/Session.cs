@@ -15,6 +15,7 @@
 //
 
 using System;
+using System.CodeDom;
 using System.Collections.Generic;
 using System.Linq;
 using System.Net;
@@ -41,7 +42,7 @@ namespace Cassandra
         }
 
         [DllImport("csharp_wrapper", CallingConvention = CallingConvention.Cdecl)]
-        unsafe private static extern void session_create(Tcb tcb, [MarshalAs(UnmanagedType.LPUTF8Str)] string uri);
+        unsafe private static extern void session_create(Tcb tcb, [MarshalAs(UnmanagedType.LPUTF8Str)] string uri, bool isTokenAware, bool isDCAware, string loca);
 
         [DllImport("csharp_wrapper", CallingConvention = CallingConvention.Cdecl)]
         unsafe private static extern void session_shutdown(Tcb tcb, IntPtr session);
@@ -124,6 +125,32 @@ namespace Cassandra
             Keyspace = keyspace;
             handle = sessionPtr;
         }
+        static (bool isTokenAware, bool isDCAware, string localDC)
+        LoadBalancingPolicyForRust(ILoadBalancingPolicy lbp)
+        {
+            bool isTokenAware = false;
+            bool isDCAware = false;
+            string localDC = null;
+
+            if (lbp is DCAwareRoundRobinPolicy dcAware)
+            {
+                isDCAware = true;
+                localDC = dcAware.LocalDc;
+            }
+            else if (lbp is TokenAwarePolicy tokenAware)
+            {
+                isTokenAware = true;
+
+                if (tokenAware.ChildPolicy is DCAwareRoundRobinPolicy dcAwareChild)
+                {
+                    isDCAware = true;
+                    localDC = dcAwareChild.LocalDc;
+                }
+            }
+
+            return (isTokenAware, isDCAware, localDC);
+        }
+
 
         static internal async Task<ISession> CreateAsync(
             ICluster cluster,
@@ -146,7 +173,13 @@ namespace Cassandra
             // in a way that Rust can call it.
             // So we pass a pointer to the method and Rust code will call it via that pointer.
             // This is a common pattern to call C# code from native code ("reversed P/Invoke").
-            session_create(tcb, contactPointUris);
+            ILoadBalancingPolicy loadBalancingPolicy = cluster.Configuration.Policies.LoadBalancingPolicy;
+            loadBalancingPolicy.Initialize(cluster);
+            var (isTokenAware, isDCAware, localDC) = LoadBalancingPolicyForRust(
+                loadBalancingPolicy
+            );
+            
+            session_create(tcb, contactPointUris, isTokenAware, isDCAware, localDC);
 
             IntPtr sessionPtr = await tcs.Task.ConfigureAwait(false);
             var session = new Session(cluster, keyspace, sessionPtr);
