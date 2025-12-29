@@ -619,46 +619,48 @@ namespace Cassandra.IntegrationTests.TestBase
             }
         }
 
-        // FIXME: Re-add once Metadata.ControlConnection is back
-        // public static void WaitForSchemaAgreement(
-        //     ICluster cluster, bool ignoreDownNodes = true, bool throwOnMaxRetries = false, int maxRetries = 20)
-        // {
-        //     var hostsLength = cluster.AllHosts().Count;
-        //     if (hostsLength == 1)
-        //     {
-        //         return;
-        //     }
-        //     var cc = cluster.Metadata.ControlConnection;
-        //     var counter = 0;
-        //     var nodesDown = ignoreDownNodes ? cluster.AllHosts().Count(h => !h.IsConsiderablyUp) : 0;
-        //     while (counter++ < maxRetries)
-        //     {
-        //         Trace.TraceInformation("Waiting for test schema agreement");
-        //         Thread.Sleep(500);
-        //         var schemaVersions = new List<Guid>();
-        //         //peers
-        //         schemaVersions.AddRange(cc.Query("SELECT peer, schema_version FROM system.peers").Select(r => r.GetValue<Guid>("schema_version")));
-        //         //local
-        //         schemaVersions.Add(cc.Query("SELECT schema_version FROM system.local WHERE key='local'").Select(r => r.GetValue<Guid>("schema_version")).First());
+        public static void WaitForSchemaAgreement(
+            ICluster cluster, bool ignoreDownNodes = true, bool throwOnMaxRetries = false, int maxRetries = 20)
+        {
+            // Metadata.ControlConnection is not available in this branch of the driver.
+            // Use the public metadata API instead of querying system tables directly.
 
-        //         var differentSchemas = schemaVersions.Distinct().Count();
-        //         if (differentSchemas <= 1 + nodesDown)
-        //         {
-        //             //There is 1 schema version or 1 + nodes that are considered as down
-        //             return;
-        //         }
-        //     }
+            var hostsLength = cluster.AllHosts().Count;
+            if (hostsLength == 1)
+            {
+                // Single-node cluster: schema agreement is immediate.
+                return;
+            }
 
-        //     if (throwOnMaxRetries)
-        //     {
-        //         throw new Exception("Reached max attempts for obtaining a single schema version from all nodes.");
-        //     }
-        // }
+            var counter = 0;
+            while (counter++ < maxRetries)
+            {
+                Trace.TraceInformation("Waiting for test schema agreement");
+                Thread.Sleep(500);
 
-        // public static void WaitForSchemaAgreement(CcmClusterInfo clusterInfo)
-        // {
-        //     TestUtils.WaitForSchemaAgreement(clusterInfo.Cluster);
-        // }
+                try
+                {
+                    if (cluster.Metadata.CheckSchemaAgreementAsync().GetAwaiter().GetResult())
+                    {
+                        return;
+                    }
+                }
+                catch (Exception ex)
+                {
+                    Trace.TraceWarning("Error while checking schema agreement: " + ex);
+                }
+            }
+
+            if (throwOnMaxRetries)
+            {
+                throw new Exception("Reached max attempts for obtaining a single schema version from all nodes.");
+            }
+        }
+
+        public static void WaitForSchemaAgreement(CcmClusterInfo clusterInfo)
+        {
+            TestUtils.WaitForSchemaAgreement(clusterInfo.Cluster);
+        }
     }
 
     /// <summary>

@@ -1,5 +1,6 @@
 use crate::CSharpStr;
 
+#[repr(C)]
 pub struct CSLoadBalancingPolicy<'a> {
     pub is_token_aware: bool,
     pub is_dc_aware: bool,

@@ -3,13 +3,14 @@ use std::convert::Infallible;
 use std::sync::Arc;
 
 use scylla::client::execution_profile::ExecutionProfile;
-use scylla::client::execution_profile::ExecutionProfile;
-use scylla::client::execution_profile::ExecutionProfileBuilder;
 use scylla::client::session::Session;
 use scylla::client::session_builder::SessionBuilder;
 use scylla::cluster::ClusterState;
 use scylla::errors::{NewSessionError, PagerExecutionError, PrepareError};
-use scylla::policies::load_balancing::{self, DefaultPolicy, LoadBalancingPolicy};
+use scylla::policies::load_balancing::{
+    DefaultPolicy, LoadBalancingPolicy, NodeIdentifier, SingleTargetLoadBalancingPolicy,
+};
+use scylla::statement::Statement;
 use scylla_cql::serialize::row::SerializedValues;
 use tokio::sync::RwLock;
 
@@ -17,7 +18,11 @@ use crate::CSharpStr;
 use crate::cs_configuration::CSConfiguration;
 use crate::cs_load_balancing_policy::CSLoadBalancingPolicy;
 use crate::error_conversion::{FfiException, MaybeShutdownError};
-use crate::ffi::{ArcFFI, BridgedBorrowedSharedPtr, BridgedOwnedSharedPtr, FFI, FromArc};
+use crate::ffi::{
+    ArcFFI, BoxFFI, BridgedBorrowedSharedPtr, BridgedOwnedExclusivePtr, BridgedOwnedSharedPtr, FFI,
+    FromArc,
+};
+use crate::pre_serialized_values::pre_serialized_values::PreSerializedValues;
 use crate::prepared_statement::BridgedPreparedStatement;
 use crate::row_set::RowSet;
 use crate::task::{BridgedFuture, ExceptionConstructors, Tcb};
@@ -64,17 +69,15 @@ pub extern "C" fn session_create(tcb: Tcb, uri: CSharpStr<'_>, configuration: CS
             .load_balancing_policy(load_balancing_policy)
             .build();
         let execution_profile_handle = profile.into_handle();
+
         tracing::debug!("[FFI] Create Session... {}", uri);
+
         let session = SessionBuilder::new()
             .known_node(&uri)
             .default_execution_profile_handle(execution_profile_handle)
             .build()
             .await?;
-        let session = SessionBuilder::new()
-            .known_node(&uri)
-            .default_execution_profile_handle(execution_profile_handle)
-            .build()
-            .await?;
+
         tracing::info!("[FFI] Session created! URI: {}", uri);
         tracing::trace!(
             "[FFI] Contacted node's address: {}",
@@ -89,18 +92,33 @@ pub extern "C" fn session_create(tcb: Tcb, uri: CSharpStr<'_>, configuration: CS
 fn create_load_balancing_policy(
     cs_load_balancing_policy: CSLoadBalancingPolicy,
 ) -> Arc<dyn LoadBalancingPolicy> {
-    let mut builder = DefaultPolicy::builder().token_aware(cs_load_balancing_policy.is_token_aware);
     let local_dc = cs_load_balancing_policy
         .local_dc
         .as_cstr()
-        .unwrap()
-        .to_str()
-        .unwrap()
-        .to_owned();
-    if (cs_load_balancing_policy.is_dc_aware) {
+        .map(|cstr| cstr.to_str().unwrap().to_owned());
+
+    let mut builder = DefaultPolicy::builder().token_aware(cs_load_balancing_policy.is_token_aware);
+    if cs_load_balancing_policy.is_dc_aware
+        && let Some(local_dc) = local_dc
+    {
         builder = builder.prefer_datacenter(local_dc);
     }
+
     builder.build()
+}
+
+fn build_single_target_lbp_from_host(host: Option<String>) -> Option<Arc<dyn LoadBalancingPolicy>> {
+    let host_str = host?;
+
+    match host_str.parse::<std::net::SocketAddr>() {
+        Ok(socket_addr) => {
+            let node_identifier = NodeIdentifier::NodeAddress(socket_addr);
+            Some(SingleTargetLoadBalancingPolicy::new(node_identifier, None))
+        }
+        Err(_e) => {
+            panic!("Passing preferred host address failed")
+        }
+    }
 }
 
 #[unsafe(no_mangle)]
@@ -194,15 +212,18 @@ pub extern "C" fn session_query(
     tcb: Tcb,
     session_ptr: BridgedBorrowedSharedPtr<'_, BridgedSession>,
     statement: CSharpStr<'_>,
+    host: CSharpStr<'_>,
 ) {
     // Convert the raw C string to a Rust string.
     let statement = statement.as_cstr().unwrap().to_str().unwrap().to_owned();
+    let host_option = host.as_cstr().map(|cstr| cstr.to_str().unwrap().to_owned());
     let session_arc = ArcFFI::cloned_from_ptr(session_ptr).unwrap();
     //TODO: use safe error propagation mechanism
 
     tracing::trace!(
-        "[FFI] Scheduling statement for execution: \"{}\"",
-        statement
+        "[FFI] Scheduling statement for execution: \"{}\" (host: {:?})",
+        statement,
+        host_option
     );
 
     // Try to acquire an owned read lock.
@@ -210,7 +231,10 @@ pub extern "C" fn session_query(
     let session_guard_res = session_arc.try_read_owned();
 
     BridgedFuture::spawn::<_, _, MaybeShutdownError<PagerExecutionError>>(tcb, async move {
-        tracing::debug!("[FFI] Executing statement \"{}\"", statement);
+        let mut stmt = Statement::new(statement);
+
+        // If a host is specified, parse it and apply a single-target policy
+        stmt.set_load_balancing_policy(build_single_target_lbp_from_host(host_option));
 
         let Ok(session_guard) = session_guard_res else {
             // Session is currently shutting down - exit with appropriate error.
@@ -228,7 +252,7 @@ pub extern "C" fn session_query(
         // Map underlying `PagerExecutionError` into `MaybeShutdownError::Inner` so
         // the BridgedFuture's error type matches.
         let query_pager = session
-            .query_iter(statement, ())
+            .query_iter(stmt, ())
             .await
             .map_err(MaybeShutdownError::Inner)?;
 
@@ -246,6 +270,7 @@ pub extern "C" fn session_query_with_values(
     session_ptr: BridgedBorrowedSharedPtr<'_, BridgedSession>,
     statement: CSharpStr<'_>,
     values_ptr: BridgedOwnedExclusivePtr<PreSerializedValues>,
+    host: CSharpStr<'_>,
 ) {
     // Take ownership of the pre-serialized values box so we can move it into the async task.
     // Important: the order of operations here matters. We need to ensure we take ownership of the box first. In case any further operations panic,
@@ -256,6 +281,7 @@ pub extern "C" fn session_query_with_values(
     // Convert the raw C string to a Rust string.
     let statement = statement.as_cstr().unwrap().to_str().unwrap().to_owned();
     let session_arc = ArcFFI::cloned_from_ptr(session_ptr).unwrap();
+    let host_option = host.as_cstr().map(|cstr| cstr.to_str().unwrap().to_owned());
     //TODO: use safe error propagation mechanism
 
     // Try to acquire an owned read lock.
@@ -264,8 +290,9 @@ pub extern "C" fn session_query_with_values(
 
     BridgedFuture::spawn::<_, _, MaybeShutdownError<PagerExecutionError>>(tcb, async move {
         tracing::debug!(
-            "[FFI] Preparing and executing statement with pre-serialized values \"{}\"",
-            statement
+            "[FFI] Preparing and executing statement with pre-serialized values \"{}\" (host: {:?})",
+            statement,
+            host_option
         );
 
         let Ok(session_guard) = session_guard_res else {
@@ -281,10 +308,12 @@ pub extern "C" fn session_query_with_values(
 
         // First, prepare the statement. Map PrepareError into PagerExecutionError::PrepareError
         // and then into MaybeShutdownError::Inner so the error type matches.
-        let prepared = session
+        let mut prepared = session
             .prepare(statement)
             .await
             .map_err(|e| MaybeShutdownError::Inner(PagerExecutionError::PrepareError(e)))?;
+
+        prepared.set_load_balancing_policy(build_single_target_lbp_from_host(host_option));
 
         // Convert our FFI wrapper into SerializedValues by consuming it.
         let serialized_values: SerializedValues = values_box.into_serialized_values();

@@ -15,7 +15,6 @@
 //
 
 using System;
-using System.CodeDom;
 using System.Collections.Generic;
 using System.Linq;
 using System.Net;
@@ -42,7 +41,7 @@ namespace Cassandra
         }
 
         [DllImport("csharp_wrapper", CallingConvention = CallingConvention.Cdecl)]
-        unsafe private static extern void session_create(Tcb tcb, [MarshalAs(UnmanagedType.LPUTF8Str)] string uri, bool isTokenAware, bool isDCAware, string loca);
+        unsafe private static extern void session_create(Tcb tcb, [MarshalAs(UnmanagedType.LPUTF8Str)] string uri, BridgedConfiguration bridgedConfiguration);
 
         [DllImport("csharp_wrapper", CallingConvention = CallingConvention.Cdecl)]
         unsafe private static extern void session_shutdown(Tcb tcb, IntPtr session);
@@ -54,7 +53,7 @@ namespace Cassandra
         unsafe private static extern void session_free(IntPtr session);
 
         [DllImport("csharp_wrapper", CallingConvention = CallingConvention.Cdecl)]
-        unsafe private static extern void session_query(Tcb tcb, IntPtr session, [MarshalAs(UnmanagedType.LPUTF8Str)] string statement);
+        unsafe private static extern void session_query(Tcb tcb, IntPtr session, [MarshalAs(UnmanagedType.LPUTF8Str)] string statement, [MarshalAs(UnmanagedType.LPUTF8Str)] string host);
 
         /// <summary>
         /// Executes a query with already-serialized values.
@@ -63,11 +62,13 @@ namespace Cassandra
         /// Values, once passed to this method, should not be used again in managed code, it's the Rust side's responsibility to handle retries
         /// and to free the memory.
         /// </summary>
-        [DllImport("csharp_wrapper", CallingConvention = CallingConvention.Cdecl)]
-        unsafe private static extern void session_query_with_values(Tcb tcb, IntPtr session, [MarshalAs(UnmanagedType.LPUTF8Str)] string statement, IntPtr valuesPtr);
+
 
         [DllImport("csharp_wrapper", CallingConvention = CallingConvention.Cdecl)]
         unsafe private static extern void session_prepare(Tcb tcb, IntPtr session, [MarshalAs(UnmanagedType.LPUTF8Str)] string statement);
+
+        [DllImport("csharp_wrapper", CallingConvention = CallingConvention.Cdecl)]
+        unsafe private static extern void session_query_with_values(Tcb tcb, IntPtr session, [MarshalAs(UnmanagedType.LPUTF8Str)] string statement, IntPtr valuesPtr, [MarshalAs(UnmanagedType.LPUTF8Str)] string host);
 
         [DllImport("csharp_wrapper", CallingConvention = CallingConvention.Cdecl)]
         unsafe private static extern void session_query_bound(Tcb tcb, IntPtr session, IntPtr preparedStatement);
@@ -125,32 +126,6 @@ namespace Cassandra
             Keyspace = keyspace;
             handle = sessionPtr;
         }
-        static (bool isTokenAware, bool isDCAware, string localDC)
-        LoadBalancingPolicyForRust(ILoadBalancingPolicy lbp)
-        {
-            bool isTokenAware = false;
-            bool isDCAware = false;
-            string localDC = null;
-
-            if (lbp is DCAwareRoundRobinPolicy dcAware)
-            {
-                isDCAware = true;
-                localDC = dcAware.LocalDc;
-            }
-            else if (lbp is TokenAwarePolicy tokenAware)
-            {
-                isTokenAware = true;
-
-                if (tokenAware.ChildPolicy is DCAwareRoundRobinPolicy dcAwareChild)
-                {
-                    isDCAware = true;
-                    localDC = dcAwareChild.LocalDc;
-                }
-            }
-
-            return (isTokenAware, isDCAware, localDC);
-        }
-
 
         static internal async Task<ISession> CreateAsync(
             ICluster cluster,
@@ -165,6 +140,13 @@ namespace Cassandra
             TaskCompletionSource<IntPtr> tcs = new(TaskCreationOptions.RunContinuationsAsynchronously);
             Tcb tcb = Tcb.WithTcs(tcs);
 
+            ILoadBalancingPolicy loadBalancingPolicy = cluster.Configuration.Policies.LoadBalancingPolicy;
+
+            BridgedLoadBalancingPolicy bridgedLBP = ConfigBridgeHelper.LoadBalancingPolicyForRust(loadBalancingPolicy);
+            BridgedConfiguration bridgedConfiguration = new BridgedConfiguration
+            {
+                loadBalancingPolicy = bridgedLBP
+            };
             // Invoke the native code, which will complete the TCS when done.
             // We need to pass a pointer to CompleteTask because Rust code cannot directly
             // call C# methods.
@@ -173,13 +155,8 @@ namespace Cassandra
             // in a way that Rust can call it.
             // So we pass a pointer to the method and Rust code will call it via that pointer.
             // This is a common pattern to call C# code from native code ("reversed P/Invoke").
-            ILoadBalancingPolicy loadBalancingPolicy = cluster.Configuration.Policies.LoadBalancingPolicy;
-            loadBalancingPolicy.Initialize(cluster);
-            var (isTokenAware, isDCAware, localDC) = LoadBalancingPolicyForRust(
-                loadBalancingPolicy
-            );
-            
-            session_create(tcb, contactPointUris, isTokenAware, isDCAware, localDC);
+            session_create(tcb, contactPointUris, bridgedConfiguration);
+
 
             IntPtr sessionPtr = await tcs.Task.ConfigureAwait(false);
             var session = new Session(cluster, keyspace, sessionPtr);
@@ -377,7 +354,7 @@ namespace Cassandra
         public Task<RowSet> ExecuteAsync(IStatement statement, string executionProfileName)
         {
             bool refAdded = false;
-            try 
+            try
             {
                 // Temporarily increment SafeHandle's ref count to protect the native handle
                 // during the synchronous P/Invoke. Rust clones the underlying Arc
@@ -402,31 +379,38 @@ namespace Cassandra
                         TaskCompletionSource<IntPtr> tcs = new(TaskCreationOptions.RunContinuationsAsynchronously);
                         Tcb tcb = Tcb.WithTcs(tcs);
 
-                    if (queryValues.Length == 0)
-                    {
-                        // Use session_use_keyspace for USE statements and session_query for other statements.
-                        // TODO: perform whole logic related to USE statements on the Rust side.
-                        if (isUseStatement)
+                        if (queryValues.Length == 0)
                         {
-                            // For USE statements, call the dedicated use_keyspace method
-                            // case_sensitive = true to respect the exact casing provided.
-                            session_use_keyspace(tcb, handle, newKeyspace, true);
+                            // Use session_use_keyspace for USE statements and session_query for other statements.
+                            // TODO: perform whole logic related to USE statements on the Rust side.
+                            if (isUseStatement)
+                            {
+                                // For USE statements, call the dedicated use_keyspace method
+                                // case_sensitive = 1 (true) to respect the exact casing provided.
+                                session_use_keyspace(tcb, handle, newKeyspace, true);
+                            }
+                            else
+                            {
+                                // Host is optional for regular statements; when not explicitly pinned,
+                                // let the underlying driver pick the coordinator by passing a null host.
+                                var hostAddress = s.Host?.Address?.ToString();
+                                session_query(tcb, handle, queryString, hostAddress);
+                            }
                         }
                         else
                         {
-                            session_query(tcb, handle, queryString);
+                            //TODO: abstract value serialization and the Rust-native function out of here
+
+                            // Host is optional for regular statements with values as well.
+                            var hostAddress = s.Host?.Address?.ToString();
+                            session_query_with_values(
+                                tcb,
+                                handle,
+                                queryString,
+                                SerializationHandler.InitializeSerializedValues(queryValues).TakeNativeHandle(),
+                                hostAddress
+                            );
                         }
-                    }
-                    else
-                    {
-                        //TODO: abstract value serialization and the Rust-native function out of here
-                        session_query_with_values(
-                            tcb,
-                            handle,
-                            queryString,
-                            SerializationHandler.InitializeSerializedValues(queryValues).TakeNativeHandle()
-                        );
-                    }
 
                         return tcs.Task.ContinueWith(t =>
                         {
