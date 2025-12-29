@@ -7,6 +7,8 @@ mod prepared_statement;
 mod row_set;
 mod session;
 mod task;
+mod cs_configuration;
+mod cs_load_balancing_policy;
 
 use std::ffi::{CStr, c_char};
 use std::fmt::Debug;
