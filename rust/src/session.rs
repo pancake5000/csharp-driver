@@ -1,6 +1,7 @@
 use std::sync::Arc;
 
 use scylla::client::execution_profile::ExecutionProfile;
+use scylla::client::execution_profile::ExecutionProfile;
 use scylla::client::execution_profile::ExecutionProfileBuilder;
 use scylla::client::session::Session;
 use scylla::client::session_builder::SessionBuilder;
@@ -9,11 +10,9 @@ use scylla::policies::load_balancing::{self, DefaultPolicy, LoadBalancingPolicy}
 use scylla_cql::serialize::row::SerializedValues;
 
 use crate::CSharpStr;
-use crate::ffi::{
-    ArcFFI, BoxFFI, BridgedBorrowedSharedPtr, BridgedOwnedExclusivePtr, BridgedOwnedSharedPtr, FFI,
-    FromArc,
-};
-use crate::pre_serialized_values::pre_serialized_values::PreSerializedValues;
+use crate::cs_configuration::CSConfiguration;
+use crate::cs_load_balancing_policy::CSLoadBalancingPolicy;
+use crate::ffi::{ArcFFI, BridgedBorrowedSharedPtr, BridgedOwnedSharedPtr, FFI, FromArc};
 use crate::prepared_statement::BridgedPreparedStatement;
 use crate::row_set::RowSet;
 use crate::task::{BridgedFuture, Tcb};
@@ -28,24 +27,22 @@ pub struct BridgedSession {
 }
 
 #[unsafe(no_mangle)]
-pub extern "C" fn session_create(
-    tcb: Tcb,
-    uri: CSharpStr<'_>,
-    is_token_aware: bool,
-    is_DC_aware: bool,
-    local_DC: CSharpStr<'_>,
-) {
+pub extern "C" fn session_create(tcb: Tcb, uri: CSharpStr<'_>, configuration: CSConfiguration) {
     // Convert the raw C string to a Rust string
     let uri = uri.as_cstr().unwrap().to_str().unwrap();
     let uri = uri.to_owned();
-    let load_balancing_policy = create_load_balancing_policy(is_token_aware, is_DC_aware, local_DC);
-
+    let load_balancing_policy = create_load_balancing_policy(configuration.load_balancing_policy);
     BridgedFuture::spawn::<_, _, NewSessionError>(tcb, async move {
-        let profile = ExecutionProfile::builder()
+        let profile: ExecutionProfile = ExecutionProfile::builder()
             .load_balancing_policy(load_balancing_policy)
             .build();
         let execution_profile_handle = profile.into_handle();
         tracing::debug!("[FFI] Create Session... {}", uri);
+        let session = SessionBuilder::new()
+            .known_node(&uri)
+            .default_execution_profile_handle(execution_profile_handle)
+            .build()
+            .await?;
         let session = SessionBuilder::new()
             .known_node(&uri)
             .default_execution_profile_handle(execution_profile_handle)
@@ -61,14 +58,18 @@ pub extern "C" fn session_create(
 }
 
 fn create_load_balancing_policy(
-    is_token_aware: bool,
-    is_DC_aware: bool,
-    local_DC: CSharpStr<'_>,
+    cs_load_balancing_policy: CSLoadBalancingPolicy,
 ) -> Arc<dyn LoadBalancingPolicy> {
-    let mut builder = DefaultPolicy::builder().token_aware(is_token_aware);
-    let local_DC = local_DC.as_cstr().unwrap().to_str().unwrap().to_owned();
-    if (is_DC_aware) {
-        builder = builder.prefer_datacenter(local_DC);
+    let mut builder = DefaultPolicy::builder().token_aware(cs_load_balancing_policy.is_token_aware);
+    let local_dc = cs_load_balancing_policy
+        .local_dc
+        .as_cstr()
+        .unwrap()
+        .to_str()
+        .unwrap()
+        .to_owned();
+    if (cs_load_balancing_policy.is_dc_aware) {
+        builder = builder.prefer_datacenter(local_dc);
     }
     builder.build()
 }
