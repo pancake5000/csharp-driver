@@ -1,7 +1,6 @@
 use std::sync::Arc;
 
 use scylla::client::execution_profile::ExecutionProfile;
-use scylla::client::execution_profile::ExecutionProfileBuilder;
 use scylla::client::session::Session;
 use scylla::client::session_builder::SessionBuilder;
 use scylla::errors::{NewSessionError, PagerExecutionError, PrepareError};
@@ -14,7 +13,11 @@ use scylla_cql::serialize::row::SerializedValues;
 use crate::CSharpStr;
 use crate::cs_configuration::CSConfiguration;
 use crate::cs_load_balancing_policy::CSLoadBalancingPolicy;
-use crate::ffi::{ArcFFI, BridgedBorrowedSharedPtr, BridgedOwnedSharedPtr, FFI, FromArc};
+use crate::ffi::{
+    ArcFFI, BoxFFI, BridgedBorrowedSharedPtr, BridgedOwnedExclusivePtr, BridgedOwnedSharedPtr, FFI,
+    FromArc,
+};
+use crate::pre_serialized_values::pre_serialized_values::PreSerializedValues;
 use crate::prepared_statement::BridgedPreparedStatement;
 use crate::row_set::RowSet;
 use crate::task::{BridgedFuture, Tcb};
@@ -40,11 +43,6 @@ pub extern "C" fn session_create(tcb: Tcb, uri: CSharpStr<'_>, configuration: CS
             .build();
         let execution_profile_handle = profile.into_handle();
         tracing::debug!("[FFI] Create Session... {}", uri);
-        let session = SessionBuilder::new()
-            .known_node(&uri)
-            .default_execution_profile_handle(execution_profile_handle)
-            .build()
-            .await?;
         let session = SessionBuilder::new()
             .known_node(&uri)
             .default_execution_profile_handle(execution_profile_handle)
