@@ -48,7 +48,7 @@ namespace Cassandra
         unsafe private static extern void session_free(IntPtr session);
 
         [DllImport("csharp_wrapper", CallingConvention = CallingConvention.Cdecl)]
-        unsafe private static extern void session_query(Tcb tcb, IntPtr session, [MarshalAs(UnmanagedType.LPUTF8Str)] string statement);
+        unsafe private static extern void session_query(Tcb tcb, IntPtr session, [MarshalAs(UnmanagedType.LPUTF8Str)] string statement, [MarshalAs(UnmanagedType.LPUTF8Str)] string host_ip);
 
         /// <summary>
         /// Executes a query with already-serialized values.
@@ -57,15 +57,15 @@ namespace Cassandra
         /// Values, once passed to this method, should not be used again in managed code, it's the Rust side's responsibility to handle retries
         /// and to free the memory.
         /// </summary>
-        
+
         [DllImport("csharp_wrapper", CallingConvention = CallingConvention.Cdecl)]
         unsafe private static extern void session_use_keyspace(Tcb tcb, IntPtr session, [MarshalAs(UnmanagedType.LPUTF8Str)] string keyspace, int isCaseSensitive);
-        
+
         [DllImport("csharp_wrapper", CallingConvention = CallingConvention.Cdecl)]
         unsafe private static extern void session_prepare(Tcb tcb, IntPtr session, [MarshalAs(UnmanagedType.LPUTF8Str)] string statement);
 
         [DllImport("csharp_wrapper", CallingConvention = CallingConvention.Cdecl)]
-        unsafe private static extern void session_query_with_values(Tcb tcb, IntPtr session, [MarshalAs(UnmanagedType.LPUTF8Str)] string statement, IntPtr valuesPtr);
+        unsafe private static extern void session_query_with_values(Tcb tcb, IntPtr session, [MarshalAs(UnmanagedType.LPUTF8Str)] string statement, IntPtr valuesPtr, [MarshalAs(UnmanagedType.LPUTF8Str)] string host_ip);
 
         [DllImport("csharp_wrapper", CallingConvention = CallingConvention.Cdecl)]
         unsafe private static extern void session_query_bound(Tcb tcb, IntPtr session, IntPtr preparedStatement);
@@ -180,20 +180,21 @@ namespace Cassandra
             // This should throw InvalidQueryException if keyspace doesn't exist.
             if (!string.IsNullOrEmpty(keyspace))
             {
-                try {
+                try
+                {
                     await session.ExecuteAsync(new SimpleStatement(CqlQueryTools.GetUseKeyspaceCql(keyspace)));
                 }
                 // TO DO: Catch more specific exception from Rust driver when keyspace does not exist.
                 catch (Exception)
                 {
                     // If validation fails, instantly dispose the session to avoid connection pool errors.
-                    try 
+                    try
                     {
                         session.Dispose();
-                    } 
+                    }
                     catch (Exception ex)
                     {
-                        Session.Logger.Error($"Failed to dispose session during keyspace validation cleanup: {ex}"); 
+                        Session.Logger.Error($"Failed to dispose session during keyspace validation cleanup: {ex}");
                     }
                     throw;
                 }
@@ -283,13 +284,13 @@ namespace Cassandra
             // Remember to dequeue from Cluster's sessions list.
 
             // Dispose the session handle which will call session_free in Rust.
-            try 
+            try
             {
                 return Task.Run(() => Dispose());
-            } 
+            }
             catch (Exception ex)
             {
-                Session.Logger.Error($"Failed to dispose session during shutdown: {ex}"); 
+                Session.Logger.Error($"Failed to dispose session during shutdown: {ex}");
                 throw;
             }
         }
@@ -387,18 +388,19 @@ namespace Cassandra
                         }
                         else
                         {
-                            session_query(tcb, handle, queryString);
+                            session_query(tcb, handle, queryString, s.Host.Address.ToString());
                         }
                     }
                     else
                     {
                         //TODO: abstract value serialization and the Rust-native function out of here
-                        
+
                         session_query_with_values(
-                            tcb, 
-                            handle, 
-                            queryString, 
-                            SerializationHandler.InitializeSerializedValues(queryValues).TakeNativeHandle()
+                            tcb,
+                            handle,
+                            queryString,
+                            SerializationHandler.InitializeSerializedValues(queryValues).TakeNativeHandle(),
+                            s.Host.Address.ToString()
                         );
                     }
 
@@ -446,7 +448,7 @@ namespace Cassandra
 
                 case BatchStatement s:
                     throw new NotImplementedException("Batches are not yet supported");
-                    // break;
+                // break;
 
                 default:
                     throw new ArgumentException("Unsupported statement type");

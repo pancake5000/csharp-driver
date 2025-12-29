@@ -1,12 +1,14 @@
 use std::sync::Arc;
 
 use scylla::client::execution_profile::ExecutionProfile;
-use scylla::client::execution_profile::ExecutionProfile;
 use scylla::client::execution_profile::ExecutionProfileBuilder;
 use scylla::client::session::Session;
 use scylla::client::session_builder::SessionBuilder;
 use scylla::errors::{NewSessionError, PagerExecutionError, PrepareError};
-use scylla::policies::load_balancing::{self, DefaultPolicy, LoadBalancingPolicy};
+use scylla::policies::load_balancing::{
+    DefaultPolicy, LoadBalancingPolicy, NodeIdentifier, SingleTargetLoadBalancingPolicy,
+};
+use scylla::statement::Statement;
 use scylla_cql::serialize::row::SerializedValues;
 
 use crate::CSharpStr;
@@ -68,7 +70,7 @@ fn create_load_balancing_policy(
         .to_str()
         .unwrap()
         .to_owned();
-    if (cs_load_balancing_policy.is_dc_aware) {
+    if cs_load_balancing_policy.is_dc_aware {
         builder = builder.prefer_datacenter(local_dc);
     }
     builder.build()
@@ -109,19 +111,45 @@ pub extern "C" fn session_query(
     tcb: Tcb,
     session_ptr: BridgedBorrowedSharedPtr<'_, BridgedSession>,
     statement: CSharpStr<'_>,
+    host: CSharpStr<'_>,
 ) {
     // Convert the raw C string to a Rust string.
     let statement = statement.as_cstr().unwrap().to_str().unwrap().to_owned();
+    let host_option = host
+        .as_cstr()
+        .map(|host_cstr| host_cstr.to_str().unwrap().to_owned());
     let bridged_session = ArcFFI::cloned_from_ptr(session_ptr).unwrap();
     //TODO: use safe error propagation mechanism
 
     tracing::trace!(
-        "[FFI] Scheduling statement for execution: \"{}\"",
-        statement
+        "[FFI] Scheduling statement for execution: \"{}\" (host: {:?})",
+        statement,
+        host_option
     );
     BridgedFuture::spawn::<_, _, PagerExecutionError>(tcb, async move {
-        tracing::debug!("[FFI] Executing statement \"{}\"", statement);
-        let query_pager = bridged_session.inner.query_iter(statement, ()).await?;
+        let mut stmt = Statement::new(statement);
+
+        // If a host is specified, parse it and apply a single-target policy
+        if let Some(host_string) = host_option {
+            match host_string.parse::<std::net::SocketAddr>() {
+                Ok(socket_addr) => {
+                    let node_identifier =
+                        scylla::policies::load_balancing::NodeIdentifier::NodeAddress(socket_addr);
+                    let load_balancing_policy =
+                        SingleTargetLoadBalancingPolicy::new(node_identifier, None);
+                    stmt.set_load_balancing_policy(Some(load_balancing_policy));
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        "[FFI] Failed to parse host string \"{}\": {}",
+                        host_string,
+                        e
+                    );
+                }
+            }
+        }
+
+        let query_pager = bridged_session.inner.query_iter(stmt, ()).await?;
         tracing::trace!("[FFI] Statement executed");
 
         Ok(RowSet {
@@ -136,6 +164,7 @@ pub extern "C" fn session_query_with_values(
     session_ptr: BridgedBorrowedSharedPtr<'_, BridgedSession>,
     statement: CSharpStr<'_>,
     values_ptr: BridgedOwnedExclusivePtr<PreSerializedValues>,
+    host: CSharpStr<'_>,
 ) {
     // Take ownership of the pre-serialized values box so we can move it into the async task.
     // Important: the order of operations here matters. We need to ensure we take ownership of the box first. In case any further operations panic,
@@ -146,17 +175,42 @@ pub extern "C" fn session_query_with_values(
     // Convert the raw C string to a Rust string.
     let statement = statement.as_cstr().unwrap().to_str().unwrap().to_owned();
     let bridged_session = ArcFFI::cloned_from_ptr(session_ptr).unwrap();
-
+    let host_option = host
+        .as_cstr()
+        .map(|host_cstr| host_cstr.to_str().unwrap().to_owned());
     //TODO: use safe error propagation mechanism
-
     BridgedFuture::spawn::<_, _, PagerExecutionError>(tcb, async move {
         tracing::debug!(
-            "[FFI] Preparing and executing statement with pre-serialized values \"{}\"",
-            statement
+            "[FFI] Preparing and executing statement with pre-serialized values \"{}\" (host: {:?})",
+            statement,
+            host_option
         );
 
         // First, prepare the statement.
-        let prepared = bridged_session.inner.prepare(statement).await?;
+        let mut prepared = bridged_session.inner.prepare(statement).await?;
+
+        // If a host is specified, parse it and apply a single-target policy
+        if let Some(host_string) = host_option {
+            match host_string.parse::<std::net::SocketAddr>() {
+                Ok(socket_addr) => {
+                    let node_identifier = NodeIdentifier::NodeAddress(socket_addr);
+                    let load_balancing_policy =
+                        SingleTargetLoadBalancingPolicy::new(node_identifier, None);
+                    prepared.set_load_balancing_policy(Some(load_balancing_policy));
+                    tracing::debug!(
+                        "[FFI] Executing prepared statement on host: {}",
+                        socket_addr
+                    );
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        "[FFI] Failed to parse host string \"{}\": {}",
+                        host_string,
+                        e
+                    );
+                }
+            }
+        }
 
         // Convert our FFI wrapper into SerializedValues by consuming it.
         let serialized_values: SerializedValues = values_box.into_serialized_values();
