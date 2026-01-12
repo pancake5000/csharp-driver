@@ -60,18 +60,33 @@ pub extern "C" fn session_create(tcb: Tcb, uri: CSharpStr<'_>, configuration: CS
 fn create_load_balancing_policy(
     cs_load_balancing_policy: CSLoadBalancingPolicy,
 ) -> Arc<dyn LoadBalancingPolicy> {
-    let mut builder = DefaultPolicy::builder().token_aware(cs_load_balancing_policy.is_token_aware);
     let local_dc = cs_load_balancing_policy
         .local_dc
         .as_cstr()
-        .unwrap()
-        .to_str()
-        .unwrap()
-        .to_owned();
-    if cs_load_balancing_policy.is_dc_aware {
+        .map(|cstr| cstr.to_str().unwrap().to_owned());
+
+    let mut builder = DefaultPolicy::builder().token_aware(cs_load_balancing_policy.is_token_aware);
+    if cs_load_balancing_policy.is_dc_aware
+        && let Some(local_dc) = local_dc
+    {
         builder = builder.prefer_datacenter(local_dc);
     }
+
     builder.build()
+}
+
+fn build_single_target_lbp_from_host(host: Option<String>) -> Option<Arc<dyn LoadBalancingPolicy>> {
+    let host_str = host?;
+
+    match host_str.parse::<std::net::SocketAddr>() {
+        Ok(socket_addr) => {
+            let node_identifier = NodeIdentifier::NodeAddress(socket_addr);
+            Some(SingleTargetLoadBalancingPolicy::new(node_identifier, None))
+        }
+        Err(_e) => {
+            panic!("Passing preffered host address failed")
+        }
+    }
 }
 
 #[unsafe(no_mangle)]
@@ -113,9 +128,7 @@ pub extern "C" fn session_query(
 ) {
     // Convert the raw C string to a Rust string.
     let statement = statement.as_cstr().unwrap().to_str().unwrap().to_owned();
-    let host_option = host
-        .as_cstr()
-        .map(|host_cstr| host_cstr.to_str().unwrap().to_owned());
+    let host_option = host.as_cstr().map(|cstr| cstr.to_str().unwrap().to_owned());
     let bridged_session = ArcFFI::cloned_from_ptr(session_ptr).unwrap();
     //TODO: use safe error propagation mechanism
 
@@ -128,24 +141,7 @@ pub extern "C" fn session_query(
         let mut stmt = Statement::new(statement);
 
         // If a host is specified, parse it and apply a single-target policy
-        if let Some(host_string) = host_option {
-            match host_string.parse::<std::net::SocketAddr>() {
-                Ok(socket_addr) => {
-                    let node_identifier =
-                        scylla::policies::load_balancing::NodeIdentifier::NodeAddress(socket_addr);
-                    let load_balancing_policy =
-                        SingleTargetLoadBalancingPolicy::new(node_identifier, None);
-                    stmt.set_load_balancing_policy(Some(load_balancing_policy));
-                }
-                Err(e) => {
-                    tracing::warn!(
-                        "[FFI] Failed to parse host string \"{}\": {}",
-                        host_string,
-                        e
-                    );
-                }
-            }
-        }
+        stmt.set_load_balancing_policy(build_single_target_lbp_from_host(host_option));
 
         let query_pager = bridged_session.inner.query_iter(stmt, ()).await?;
         tracing::trace!("[FFI] Statement executed");
@@ -173,9 +169,7 @@ pub extern "C" fn session_query_with_values(
     // Convert the raw C string to a Rust string.
     let statement = statement.as_cstr().unwrap().to_str().unwrap().to_owned();
     let bridged_session = ArcFFI::cloned_from_ptr(session_ptr).unwrap();
-    let host_option = host
-        .as_cstr()
-        .map(|host_cstr| host_cstr.to_str().unwrap().to_owned());
+    let host_option = host.as_cstr().map(|cstr| cstr.to_str().unwrap().to_owned());
     //TODO: use safe error propagation mechanism
     BridgedFuture::spawn::<_, _, PagerExecutionError>(tcb, async move {
         tracing::debug!(
@@ -188,27 +182,7 @@ pub extern "C" fn session_query_with_values(
         let mut prepared = bridged_session.inner.prepare(statement).await?;
 
         // If a host is specified, parse it and apply a single-target policy
-        if let Some(host_string) = host_option {
-            match host_string.parse::<std::net::SocketAddr>() {
-                Ok(socket_addr) => {
-                    let node_identifier = NodeIdentifier::NodeAddress(socket_addr);
-                    let load_balancing_policy =
-                        SingleTargetLoadBalancingPolicy::new(node_identifier, None);
-                    prepared.set_load_balancing_policy(Some(load_balancing_policy));
-                    tracing::debug!(
-                        "[FFI] Executing prepared statement on host: {}",
-                        socket_addr
-                    );
-                }
-                Err(e) => {
-                    tracing::warn!(
-                        "[FFI] Failed to parse host string \"{}\": {}",
-                        host_string,
-                        e
-                    );
-                }
-            }
-        }
+        prepared.set_load_balancing_policy(build_single_target_lbp_from_host(host_option));
 
         // Convert our FFI wrapper into SerializedValues by consuming it.
         let serialized_values: SerializedValues = values_box.into_serialized_values();

@@ -8,14 +8,13 @@
 //      http://www.apache.org/licenses/LICENSE-2.0
 //
 //   Unless required by applicable law or agreed to in writing, software
-//   distributed under the License is distributed on an "AS IS" BASIS,
+//   distributed under the License is distributed on an "AS S" BASIS,
 //   WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 //   See the License for the specific language governing permissions and
 //   limitations under the License.
 //
 
 using System;
-using System.CodeDom;
 using System.Collections.Generic;
 using System.Linq;
 using System.Net;
@@ -42,13 +41,13 @@ namespace Cassandra
         }
 
         [DllImport("csharp_wrapper", CallingConvention = CallingConvention.Cdecl)]
-        unsafe private static extern void session_create(Tcb tcb, [MarshalAs(UnmanagedType.LPUTF8Str)] string uri, bool isTokenAware, bool isDCAware, string loca);
+        unsafe private static extern void session_create(Tcb tcb, [MarshalAs(UnmanagedType.LPUTF8Str)] string uri, BridgedConfiguration bridgedConfiguration);
 
         [DllImport("csharp_wrapper", CallingConvention = CallingConvention.Cdecl)]
         unsafe private static extern void session_free(IntPtr session);
 
         [DllImport("csharp_wrapper", CallingConvention = CallingConvention.Cdecl)]
-        unsafe private static extern void session_query(Tcb tcb, IntPtr session, [MarshalAs(UnmanagedType.LPUTF8Str)] string statement, [MarshalAs(UnmanagedType.LPUTF8Str)] string host_ip);
+        unsafe private static extern void session_query(Tcb tcb, IntPtr session, [MarshalAs(UnmanagedType.LPUTF8Str)] string statement, [MarshalAs(UnmanagedType.LPUTF8Str)] string host);
 
         /// <summary>
         /// Executes a query with already-serialized values.
@@ -65,7 +64,7 @@ namespace Cassandra
         unsafe private static extern void session_prepare(Tcb tcb, IntPtr session, [MarshalAs(UnmanagedType.LPUTF8Str)] string statement);
 
         [DllImport("csharp_wrapper", CallingConvention = CallingConvention.Cdecl)]
-        unsafe private static extern void session_query_with_values(Tcb tcb, IntPtr session, [MarshalAs(UnmanagedType.LPUTF8Str)] string statement, IntPtr valuesPtr, [MarshalAs(UnmanagedType.LPUTF8Str)] string host_ip);
+        unsafe private static extern void session_query_with_values(Tcb tcb, IntPtr session, [MarshalAs(UnmanagedType.LPUTF8Str)] string statement, IntPtr valuesPtr, [MarshalAs(UnmanagedType.LPUTF8Str)] string host);
 
         [DllImport("csharp_wrapper", CallingConvention = CallingConvention.Cdecl)]
         unsafe private static extern void session_query_bound(Tcb tcb, IntPtr session, IntPtr preparedStatement);
@@ -117,32 +116,6 @@ namespace Cassandra
             Keyspace = keyspace;
             handle = sessionPtr;
         }
-        static (bool isTokenAware, bool isDCAware, string localDC)
-        LoadBalancingPolicyForRust(ILoadBalancingPolicy lbp)
-        {
-            bool isTokenAware = false;
-            bool isDCAware = false;
-            string localDC = null;
-
-            if (lbp is DCAwareRoundRobinPolicy dcAware)
-            {
-                isDCAware = true;
-                localDC = dcAware.LocalDc;
-            }
-            else if (lbp is TokenAwarePolicy tokenAware)
-            {
-                isTokenAware = true;
-
-                if (tokenAware.ChildPolicy is DCAwareRoundRobinPolicy dcAwareChild)
-                {
-                    isDCAware = true;
-                    localDC = dcAwareChild.LocalDc;
-                }
-            }
-
-            return (isTokenAware, isDCAware, localDC);
-        }
-
 
         static internal async Task<ISession> CreateAsync(
             ICluster cluster,
@@ -157,6 +130,13 @@ namespace Cassandra
             TaskCompletionSource<IntPtr> tcs = new(TaskCreationOptions.RunContinuationsAsynchronously);
             Tcb tcb = Tcb.WithTcs(tcs);
 
+            ILoadBalancingPolicy loadBalancingPolicy = cluster.Configuration.Policies.LoadBalancingPolicy;
+            loadBalancingPolicy.Initialize(cluster);
+            BridgedLoadBalancingPolicy bridgedLBP = ConfigBridgeHelper.LoadBalancingPolicyForRust(loadBalancingPolicy);
+            BridgedConfiguration bridgedConfiguration = new BridgedConfiguration
+            {
+                loadBalancingPolicy = bridgedLBP
+            };
             // Invoke the native code, which will complete the TCS when done.
             // We need to pass a pointer to CompleteTask because Rust code cannot directly
             // call C# methods.
@@ -165,13 +145,7 @@ namespace Cassandra
             // in a way that Rust can call it.
             // So we pass a pointer to the method and Rust code will call it via that pointer.
             // This is a common pattern to call C# code from native code ("reversed P/Invoke").
-            ILoadBalancingPolicy loadBalancingPolicy = cluster.Configuration.Policies.LoadBalancingPolicy;
-            loadBalancingPolicy.Initialize(cluster);
-            var (isTokenAware, isDCAware, localDC) = LoadBalancingPolicyForRust(
-                loadBalancingPolicy
-            );
-            
-            session_create(tcb, contactPointUris, isTokenAware, isDCAware, localDC);
+            session_create(tcb, contactPointUris, bridgedConfiguration);
 
             IntPtr sessionPtr = await tcs.Task.ConfigureAwait(false);
             var session = new Session(cluster, keyspace, sessionPtr);
@@ -388,19 +362,21 @@ namespace Cassandra
                         }
                         else
                         {
-                            session_query(tcb, handle, queryString, s.Host.Address.ToString());
+                            var hostAddress = s.Host.Address.ToString();
+                            session_query(tcb, handle, queryString, hostAddress);
                         }
                     }
                     else
                     {
                         //TODO: abstract value serialization and the Rust-native function out of here
 
+                        var hostAddress = s.Host.Address.ToString();
                         session_query_with_values(
                             tcb,
                             handle,
                             queryString,
                             SerializationHandler.InitializeSerializedValues(queryValues).TakeNativeHandle(),
-                            s.Host.Address.ToString()
+                            hostAddress
                         );
                     }
 
