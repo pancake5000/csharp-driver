@@ -209,6 +209,7 @@ impl InvalidQueryConstructor {
     }
 }
 
+// Special errors for C# wrapper.
 
 /// Wrapper enum to represent errors that may occur normally or indicate that the session has been
 /// shut down. It allows to return a clear error condition while satisfying the return type requirements.
@@ -238,6 +239,13 @@ pub(crate) enum MaybeShutdownError<E> {
 /// The handle must be freed on the C# side when no longer needed.
 pub trait ErrorToException {
     fn to_exception(&self, ctors: &ExceptionConstructors) -> ExceptionPtr;
+}
+
+// This allows returning Infallible as an error type in functions that cannot fail.
+impl ErrorToException for std::convert::Infallible {
+    fn to_exception(&self, _ctors: &ExceptionConstructors) -> ExceptionPtr {
+        match *self {}
+    }
 }
 
 // Specific mapping for PagerExecutionError.
