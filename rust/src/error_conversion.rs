@@ -1,7 +1,8 @@
 use crate::ffi::{FFIByteSlice, FFIStr};
 use scylla::errors::{
-    ConnectionError, ConnectionPoolError, DbError, MetadataError, NewSessionError, NextPageError,
-    PagerExecutionError, PrepareError, RequestAttemptError, RequestError,
+    ConnectionError, ConnectionPoolError, DbError, DeserializationError, MetadataError,
+    NewSessionError, NextPageError, NextRowError, PagerExecutionError, PrepareError,
+    RequestAttemptError, RequestError,
 };
 use std::fmt::{Debug, Display};
 use std::mem::size_of;
@@ -377,6 +378,18 @@ impl ErrorToException for (&DbError, &str) {
                 .rust_exception_constructor
                 .construct_from_rust(db_error),
         }
+    }
+}
+
+impl ErrorToException for DeserializationError {
+    fn to_exception(&self, ctors: &ExceptionConstructors) -> ExceptionPtr {
+        ctors.rust_exception_constructor.construct_from_rust(self) // TODO: convert errors to specific exceptions
+    }
+}
+
+impl ErrorToException for NextRowError {
+    fn to_exception(&self, ctors: &ExceptionConstructors) -> ExceptionPtr {
+        ctors.rust_exception_constructor.construct_from_rust(self) // TODO: convert errors to specific exceptions
     }
 }
 

@@ -1,14 +1,15 @@
 use scylla::client::pager::QueryPager;
 use scylla::cluster::metadata::CollectionType;
-use scylla::errors::DeserializationError;
 use scylla::frame::response::result::{ColumnType, NativeType};
 
 use crate::FfiPtr;
+use crate::error_conversion::FfiException;
 use crate::ffi::{
     ArcFFI, BridgedBorrowedSharedPtr, BridgedOwnedSharedPtr, FFI, FFIByteSlice, FFIStr, FromArc,
     FromRef, RefFFI,
 };
 use crate::task::BridgedFuture;
+use crate::task::ExceptionConstructors;
 
 // TO DO: Don't use mock RowSet - remove Option<> from the pager field
 #[derive(Debug)]
@@ -68,7 +69,7 @@ type SetMetadata = unsafe extern "C" fn(
     type_code: u8,
     type_info_handle: BridgedBorrowedSharedPtr<'_, ColumnType<'_>>,
     is_frozen: u8,
-);
+) -> FfiException;
 
 /// Calls back into C# for each column to provide metadata.
 /// `metadata_setter` is a function pointer supplied by C# - it will be called synchronously for each column.
@@ -80,11 +81,16 @@ pub extern "C" fn row_set_fill_columns_metadata(
     row_set_ptr: BridgedBorrowedSharedPtr<'_, RowSet>,
     columns_ptr: ColumnsPtr,
     set_metadata: SetMetadata,
-) {
+    constructors: &ExceptionConstructors,
+) -> FfiException {
     let row_set = ArcFFI::as_ref(row_set_ptr).unwrap();
     let pager_guard = row_set.pager.lock().unwrap();
     let Some(pager) = pager_guard.as_ref() else {
-        return;
+        // Return a RustException built via constructors as a quick workaround.
+        let ex = constructors
+            .rust_exception_constructor
+            .construct_from_rust("RowSet has no pager to get metadata from");
+        return FfiException::from_exception(ex);
     };
 
     // Iterate column specs and call the metadata setter
@@ -109,7 +115,7 @@ pub extern "C" fn row_set_fill_columns_metadata(
         };
 
         unsafe {
-            set_metadata(
+            let ffi_exception = set_metadata(
                 columns_ptr,
                 i,
                 name,
@@ -119,8 +125,13 @@ pub extern "C" fn row_set_fill_columns_metadata(
                 type_info_handle,
                 is_frozen as u8,
             );
+            // If there is an exception returned from callback, throw it as soon as possible
+            if ffi_exception.has_exception() {
+                return ffi_exception;
+            }
         }
     }
+    FfiException::ok()
 }
 
 #[derive(Clone, Copy)]
@@ -150,7 +161,7 @@ type DeserializeValue = unsafe extern "C" fn(
     value_index: usize,
     serializer_ptr: SerializerPtr,
     frame_slice: FFIByteSlice<'_>,
-);
+) -> FfiException;
 
 #[unsafe(no_mangle)]
 pub extern "C" fn row_set_next_row<'row_set>(
@@ -159,62 +170,94 @@ pub extern "C" fn row_set_next_row<'row_set>(
     columns_ptr: ColumnsPtr,
     values_ptr: ValuesPtr,
     serializer_ptr: SerializerPtr,
-) -> bool {
+    out_has_row: *mut bool,
+    constructors: &ExceptionConstructors,
+) -> FfiException {
     let row_set = ArcFFI::as_ref(row_set_ptr).unwrap();
     let mut pager_guard = row_set.pager.lock().unwrap();
     let Some(pager) = pager_guard.as_mut() else {
-        return false; // Empty RowSet has no rows
+        unsafe {
+            *out_has_row = false;
+        }
+        return FfiException::ok(); // Empty RowSet has no rows
     };
     let num_columns = pager.column_specs().len();
 
     let deserialize_fut = async {
+        // Returns Ok(true) when a row was read and deserialized,
+        // Ok(false) when there are no more rows,
+        // Err(FfiException) when an error occurs and should be propagated to C#.
         // TODO: consider how to handle possibility of the metadata to change between pages.
         // While unlikely, it's not impossible.
         // For now, we just assume it won't happen and ignore `_new_page_began`.
         // The problem is that C# assumes the same metadata for the whole RowSet,
         // and they are passed through `ColumnsPtr`. Currently, if the metadata changes,
         // C# code will attempt to deserialize columns with wrong types, likely leading to exceptions.
-        if let Some(Ok((mut column_iterator, _new_page_began))) = pager.next_column_iterator().await
-        {
-            // For each column in the row, we call `deserialize_value()`.
-            for value_index in 0..num_columns {
-                let raw_column = column_iterator.next().unwrap_or_else(|| {
-                    // FIXME: handle error properly, passing it to C#.
-                    #[expect(unreachable_code)]
-                    Err(DeserializationError::new(todo!(
-                        "Implement error type for too few columns - server provided less columns than claimed in the metadata"
-                    )))
-                }).unwrap(); // FIXME: handle error properly, passing it to C#.
+        let Some(next) = pager.next_column_iterator().await else {
+            tracing::trace!("[FFI] No more rows available!");
+            return Ok(false);
+        };
 
-                if let Some(frame_slice) = raw_column.slice {
-                    unsafe {
-                        deserialize_value(
-                            columns_ptr,
-                            values_ptr,
-                            value_index,
-                            serializer_ptr,
-                            FFIByteSlice::new(frame_slice.as_slice()),
-                        );
-                    }
-                } else {
-                    // The value is null, so we skip deserialization.
-                    // We can do that because `object[] values` in C# is initialized with nulls.
-                    continue;
+        let (mut column_iterator, _new_page_began) = match next {
+            // Successfully obtained the next row's column iterator
+            Ok(values) => values,
+            // Error while fetching the column value
+            Err(err) => return Err(FfiException::from_error(err, constructors)),
+        };
+
+        for value_index in 0..num_columns {
+            let Some(column_res) = column_iterator.next() else {
+                // Error: fewer columns than expected
+                // TODO: Implement error type for too few columns - server provided less columns than claimed in the metadata
+                let ex = constructors
+                    .rust_exception_constructor
+                    .construct_from_rust(format!(
+                        "Row contains fewer columns ({} of {}) than metadata claims",
+                        value_index, num_columns
+                    ));
+                return Err(FfiException::from_exception(ex));
+            };
+
+            let raw_column = match column_res {
+                Ok(rc) => rc,
+                Err(err) => return Err(FfiException::from_error(err, constructors)),
+            };
+
+            let Some(frame_slice) = raw_column.slice else {
+                // The value is null, so we skip deserialization.
+                // We can do that because `object[] values` in C# is initialized with nulls.
+                continue;
+            };
+
+            unsafe {
+                let ffi_exception = deserialize_value(
+                    columns_ptr,
+                    values_ptr,
+                    value_index,
+                    serializer_ptr,
+                    FFIByteSlice::new(frame_slice.as_slice()),
+                );
+                if ffi_exception.has_exception() {
+                    return Err(ffi_exception);
                 }
             }
-            true
-        } else {
-            tracing::trace!("[FFI] No more rows available!");
-            false
         }
+
+        Ok(true)
     };
 
     // This is inherently inefficient, but necessary due to blocking C# API upon page boundaries.
     // TODO: implement async C# API (IAsyncEnumerable) to avoid this.
-    BridgedFuture::block_on(deserialize_fut)
-}
+    let (has_row, result) = match BridgedFuture::block_on(deserialize_fut) {
+        Ok(has_row) => (has_row, FfiException::ok()),
+        Err(exception) => (false, exception),
+    };
+    unsafe {
+        *out_has_row = has_row;
+    }
 
-// TODO: Below change all unwrap() to unwrap_or_else() with proper error handling
+    result
+}
 
 #[unsafe(no_mangle)]
 pub extern "C" fn row_set_type_info_get_code(
