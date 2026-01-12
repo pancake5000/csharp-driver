@@ -4,6 +4,7 @@ use scylla::errors::{
     PagerExecutionError, PrepareError, RequestAttemptError, RequestError,
 };
 use std::fmt::{Debug, Display};
+use std::mem::size_of;
 use std::ptr::NonNull;
 use thiserror::Error;
 
@@ -18,6 +19,45 @@ enum Exception {}
 #[derive(Clone, Copy, Debug)]
 #[repr(transparent)]
 pub struct ExceptionPtr(NonNull<Exception>);
+
+/// Wrapper struct for returning exceptions over FFI.
+///
+/// The pointer inside this package references a GCHandle allocated on the C# side.
+/// Rust must treat this as an opaque handle and must not attempt to free it.
+/// At the managed boundary, C# must either throw (which frees) or explicitly free the handle.
+/// All changes to this struct must be mirrored in C# code in the exact same order.
+#[repr(transparent)]
+pub struct FfiException {
+    pub exception: Option<ExceptionPtr>,
+}
+
+// Compile-time assertion that `FfiException` is pointer-sized.
+// Ensures ABI compatibility with C# (opaque GCHandle/IntPtr across FFI).
+const _: [(); size_of::<FfiException>()] = [(); size_of::<*const ()>()];
+
+impl FfiException {
+    pub(crate) fn ok() -> Self {
+        Self { exception: None }
+    }
+
+    pub(crate) fn from_exception(exception: ExceptionPtr) -> Self {
+        Self {
+            exception: Some(exception),
+        }
+    }
+
+    pub(crate) fn from_error<E>(error: E, constructors: &ExceptionConstructors) -> Self
+    where
+        E: ErrorToException,
+    {
+        let exception_ptr = error.to_exception(constructors);
+        Self::from_exception(exception_ptr)
+    }
+
+    pub(crate) fn has_exception(&self) -> bool {
+        self.exception.is_some()
+    }
+}
 
 #[repr(transparent)]
 pub struct RustExceptionConstructor(unsafe extern "C" fn(message: FFIStr<'_>) -> ExceptionPtr);

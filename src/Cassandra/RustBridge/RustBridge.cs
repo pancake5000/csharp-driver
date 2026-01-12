@@ -437,5 +437,105 @@ namespace Cassandra
                 Console.Error.WriteLine($"[FFI] FailTask threw exception: {ex}");
             }
         }
+
+        /// <summary>
+        /// Package used to pass exceptions from Rust to C# over FFI boundary.
+        /// If the underlying pointer is IntPtr.Zero, no exception occurred.
+        /// If it's non-zero, it points to a GCHandle referencing the Exception.
+        /// This handle must be freed even when a different exception is thrown.
+        /// All changes to this struct's fields must be mirrored in Rust code in the exact same order.
+        /// </summary>
+        [StructLayout(LayoutKind.Sequential)]
+        internal struct FfiException
+        {   
+            // Fields:
+            // Pointer to a GCHandle referencing the Exception.
+            internal IntPtr exception;
+
+            // Functions:
+            // Creates an FfiException from the given Exception.
+            internal static FfiException FromException(Exception ex)
+            {
+                var handle = GCHandle.Alloc(ex);
+                IntPtr handlePtr = GCHandle.ToIntPtr(handle);
+                return new FfiException
+                {
+                    exception = handlePtr
+                };
+            }
+
+            // Creates an FfiException representing no exception.
+            internal static FfiException Ok()
+            {
+                return new FfiException
+                {
+                    exception = IntPtr.Zero
+                };
+            }
+
+            internal bool HasException => exception != IntPtr.Zero;
+        }
+
+        /// <summary>
+        /// Throws the exception contained in the FfiException if any.
+        /// This mustn't be used in UnmanagedCallersOnly methods because throwing exceptions
+        /// across FFI boundary is UB.
+        /// </summary>
+        internal static void ThrowIfException(ref FfiException res)
+        {
+            if (res.exception == IntPtr.Zero)
+            {
+                return;
+            }
+
+            Exception exception;
+            var exHandle = GCHandle.FromIntPtr(res.exception);
+            try
+            {
+                if (exHandle.Target is Exception ex)
+                {
+                    exception = ex;
+                }
+                else
+                {
+                    Environment.FailFast("Failed to recover Exception from GCHandle passed from Rust (sync).");
+                    return; // Unreachable
+                }
+            }
+            finally
+            {
+                if (exHandle.IsAllocated)
+                {
+                    exHandle.Free();
+                }
+                // Zero out the pointer to avoid double free if caller invokes FreeIfPresent
+                res.exception = IntPtr.Zero;
+            }
+            throw exception;
+        }
+
+        /// <summary>
+        /// Frees the exception handle contained in the package without throwing.
+        /// Safe to call multiple times; subsequent calls become no-ops.
+        /// </summary>
+        internal static void FreeExceptionHandle(ref FfiException res)
+        {
+            if (res.exception == IntPtr.Zero)
+            {
+                return;
+            }
+            var exHandle = GCHandle.FromIntPtr(res.exception);
+            try
+            {
+                if (exHandle.IsAllocated)
+                {
+                    exHandle.Free();
+                }
+            }
+            finally
+            {
+                res.exception = IntPtr.Zero;
+            }
+        }
     }
 }
