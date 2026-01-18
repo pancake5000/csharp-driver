@@ -39,6 +39,9 @@ namespace Cassandra
 #pragma warning restore CS0067
 
         [DllImport("csharp_wrapper", CallingConvention = CallingConvention.Cdecl)]
+        private static extern IntPtr cluster_state_get_raw_ptr(IntPtr clusterStatePtr);
+
+        [DllImport("csharp_wrapper", CallingConvention = CallingConvention.Cdecl)]
         private static extern void cluster_state_free(IntPtr clusterStatePtr);
 
         /// <summary>
@@ -61,6 +64,31 @@ namespace Cassandra
         // Provided by Cluster during construction. It never returns null.
         // It either returns a valid Session or throws InvalidOperationException.
         private readonly Func<Session> _getActiveSessionOrThrow;
+
+        // Pointer to the last cluster state used to detect changes. This is a raw pointer 
+        // stored only for comparison purposes - it does not extend the lifetime of the ClusterState. 
+        // Volatile ensures visibility of updates across threads for the lock-free read in AllHosts().
+        private volatile IntPtr _lastClusterStatePtr = IntPtr.Zero;
+
+        // HostRegistry groups both maps so they can be swapped atomically.
+        private sealed class HostRegistry(
+            IReadOnlyDictionary<Guid, Host> hostsById,
+            IReadOnlyDictionary<IPEndPoint, Guid> hostIdsByIp)
+        {
+            public readonly IReadOnlyDictionary<Guid, Host> HostsById =
+                hostsById ?? new Dictionary<Guid, Host>();
+
+            public readonly IReadOnlyDictionary<IPEndPoint, Guid> HostIdsByIp =
+                hostIdsByIp ?? new Dictionary<IPEndPoint, Guid>();
+        }
+
+        // Active host registry reference; swapped atomically on refresh.
+        // NOTE: Do not access this field directly; use GetRegistry() instead, since the accessor covers the
+        // refreshment logic, with a compromise between limited data staleness and performance.
+        private volatile HostRegistry _hostRegistry =
+            new HostRegistry(new Dictionary<Guid, Host>(), new Dictionary<IPEndPoint, Guid>());
+
+        private readonly object _hostLock = new object();
 
         internal Metadata(Configuration configuration, Func<Session> getActiveSessionOrThrow)
         {
@@ -106,6 +134,66 @@ namespace Cassandra
         public ICollection<HostShard> GetReplicas(byte[] partitionKey)
         {
             throw new NotImplementedException();
+        }
+
+        /// <summary>
+        /// Returns a registry instance, refreshing topology if needed.
+        /// </summary>
+        private HostRegistry GetRegistry()
+        {
+            var session = _getActiveSessionOrThrow();
+            IntPtr clusterStatePtr;
+
+            try
+            {
+                // Check if cache is valid without lock first using a temporary pointer check.
+                // This avoids waiting on the lock for the common case where topology hasn't changed.
+                clusterStatePtr = session.GetClusterStatePtr();
+                try
+                {
+                    IntPtr rawPtr = cluster_state_get_raw_ptr(clusterStatePtr);
+                    if (_lastClusterStatePtr != IntPtr.Zero && rawPtr == _lastClusterStatePtr)
+                    {
+                        return _hostRegistry;
+                    }
+                }
+                finally
+                {
+                    // Free the fetched cluster state pointer.
+                    cluster_state_free(clusterStatePtr);
+                }
+
+                // Acquire the host lock to perform update if needed.
+                lock (_hostLock)
+                {
+                    // Acquire fresh pointer inside lock - the cluster state may have changed while waiting for lock.
+                    clusterStatePtr = session.GetClusterStatePtr();
+                    try
+                    {
+                        // Double-check: another thread may have updated the cache while we waited for lock
+                        IntPtr rawPtr = cluster_state_get_raw_ptr(clusterStatePtr);
+                        if (_lastClusterStatePtr != IntPtr.Zero && rawPtr == _lastClusterStatePtr)
+                        {
+                            return _hostRegistry;
+                        }
+
+                        // Store the raw pointer address for future comparisons.
+                        _lastClusterStatePtr = rawPtr;
+
+                        return _hostRegistry;
+                    }
+                    finally
+                    {
+                        // Always free the fetched cluster state pointer to avoid memory leak.
+                        cluster_state_free(clusterStatePtr);
+                    }
+                }
+            }
+            finally
+            {
+                // Release the lock on the session created by GetActiveSessionOrThrow. 
+                session.DecreaseReferenceCount();
+            }
         }
 
         /// <summary>
