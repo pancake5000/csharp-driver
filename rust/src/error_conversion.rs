@@ -261,6 +261,17 @@ impl SerializationExceptionConstructor {
     }
 }
 
+pub struct DeserializationExceptionConstructor(
+    unsafe extern "C" fn(message: FFIStr<'_>) -> ExceptionPtr,
+);
+
+impl DeserializationExceptionConstructor {
+    pub(crate) fn construct_from_rust(&self, message: &str) -> ExceptionPtr {
+        let message = FFIStr::new(message);
+        unsafe { (self.0)(message) }
+    }
+}
+
 // Special errors for C# wrapper.
 
 /// Wrapper enum to represent errors that may occur normally or indicate that the session has been
@@ -394,7 +405,9 @@ impl ErrorToException for (&DbError, &str) {
 
 impl ErrorToException for DeserializationError {
     fn to_exception(&self, ctors: &ExceptionConstructors) -> ExceptionPtr {
-        ctors.rust_exception_constructor.construct_from_rust(self) // TODO: convert errors to specific exceptions
+        ctors
+            .deserialization_exception_constructor
+            .construct_from_rust(&self.to_string())
     }
 }
 

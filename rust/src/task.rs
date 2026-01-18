@@ -8,7 +8,8 @@ use tokio::runtime::Runtime;
 
 use crate::FfiPtr;
 use crate::error_conversion::{
-    AlreadyExistsConstructor, AlreadyShutdownExceptionConstructor, ErrorToException, ExceptionPtr,
+    AlreadyExistsConstructor, AlreadyShutdownExceptionConstructor,
+    DeserializationExceptionConstructor, ErrorToException, ExceptionPtr,
     FunctionFailureExceptionConstructor, InvalidConfigurationInQueryExceptionConstructor,
     InvalidQueryConstructor, NoHostAvailableExceptionConstructor,
     OperationTimedOutExceptionConstructor, PreparedQueryNotFoundExceptionConstructor,
@@ -72,6 +73,7 @@ pub struct Tcb {
 pub struct ExceptionConstructors {
     pub already_exists_constructor: AlreadyExistsConstructor,
     pub already_shutdown_exception_constructor: AlreadyShutdownExceptionConstructor,
+    pub deserialization_exception_constructor: DeserializationExceptionConstructor,
     pub function_failure_exception_constructor: FunctionFailureExceptionConstructor,
     pub invalid_configuration_in_query_constructor: InvalidConfigurationInQueryExceptionConstructor,
     pub invalid_query_constructor: InvalidQueryConstructor,

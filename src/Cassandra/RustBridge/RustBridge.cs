@@ -172,6 +172,7 @@ namespace Cassandra
         // Exception constructors passed to Rust
         unsafe readonly static delegate* unmanaged[Cdecl]<FFIString, FFIString, IntPtr> AlreadyExistsConstructorPtr = &AlreadyExistsException.AlreadyExistsExceptionFromRust;
         unsafe readonly static delegate* unmanaged[Cdecl]<FFIString, IntPtr> AlreadyShutdownExceptionConstructorPtr = &AlreadyShutdownException.AlreadyShutdownExceptionFromRust;
+        unsafe readonly static delegate* unmanaged[Cdecl]<FFIString, IntPtr> DeserializationExceptionConstructorPtr = &DeserializationException.DeserializationExceptionFromRust;
         unsafe readonly static delegate* unmanaged[Cdecl]<FFIString, IntPtr> FunctionFailureExceptionConstructorPtr = &FunctionFailureException.FunctionFailureExceptionFromRust;
         unsafe readonly static delegate* unmanaged[Cdecl]<FFIString, IntPtr> InvalidConfigurationInQueryExceptionConstructorPtr = &InvalidConfigurationInQueryException.InvalidConfigurationInQueryExceptionFromRust;
         unsafe readonly static delegate* unmanaged[Cdecl]<FFIString, IntPtr> InvalidQueryConstructorPtr = &InvalidQueryException.InvalidQueryExceptionFromRust;
@@ -197,6 +198,7 @@ namespace Cassandra
         {
             internal readonly IntPtr already_exists_constructor;
             internal readonly IntPtr already_shutdown_exception_constructor;
+            internal readonly IntPtr deserialization_exception_constructor;
             internal readonly IntPtr function_failure_exception_constructor;
             internal readonly IntPtr invalid_configuration_in_query_constructor;
             internal readonly IntPtr invalid_query_constructor;
@@ -214,6 +216,7 @@ namespace Cassandra
             internal Constructors(
                 IntPtr alreadyExistsException,
                 IntPtr alreadyShutdownException,
+                IntPtr deserializationException,
                 IntPtr functionFailureException,
                 IntPtr invalidConfigurationInQueryException,
                 IntPtr invalidQueryException,
@@ -230,6 +233,7 @@ namespace Cassandra
             {
                 already_exists_constructor = alreadyExistsException;
                 already_shutdown_exception_constructor = alreadyShutdownException;
+                deserialization_exception_constructor = deserializationException;
                 function_failure_exception_constructor = functionFailureException;
                 invalid_configuration_in_query_constructor = invalidConfigurationInQueryException;
                 invalid_query_constructor = invalidQueryException;
@@ -255,6 +259,7 @@ namespace Cassandra
             *ConstructorsPtr = new Constructors(
                 (IntPtr)AlreadyExistsConstructorPtr,
                 (IntPtr)AlreadyShutdownExceptionConstructorPtr,
+                (IntPtr)DeserializationExceptionConstructorPtr,
                 (IntPtr)FunctionFailureExceptionConstructorPtr,
                 (IntPtr)InvalidConfigurationInQueryExceptionConstructorPtr,
                 (IntPtr)InvalidQueryConstructorPtr,
