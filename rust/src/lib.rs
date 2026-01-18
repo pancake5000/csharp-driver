@@ -19,6 +19,10 @@ pub struct FfiPtr<'a, T: Sized> {
     _phantom: PhantomData<&'a ()>,
 }
 
+// Compile-time assertion that `FfiPtr` is pointer-sized.
+// Ensures ABI compatibility with C# (opaque GCHandle/IntPtr across FFI).
+const _: [(); std::mem::size_of::<FfiPtr<'_, ()>>()] = [(); std::mem::size_of::<*const ()>()];
+
 impl<'a, T> Debug for FfiPtr<'a, T> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let ptr = self
