@@ -1,9 +1,8 @@
 use super::csharp_memory::{CsharpSerializedValue, CsharpValuePtr};
 use super::pre_serialized_values::PreSerializedValues;
-use crate::FfiError;
+use crate::error_conversion::FfiException;
 use crate::ffi::{BoxFFI, BridgedBorrowedExclusivePtr, BridgedOwnedExclusivePtr};
-use std::ffi::CString;
-
+use crate::task::ExceptionConstructors;
 // TODO: consider moving to pre_serialized_values/pre_serialized_values.rs
 
 #[unsafe(no_mangle)]
@@ -20,25 +19,15 @@ pub unsafe extern "C" fn pre_serialized_values_add_value(
     values_ptr: BridgedBorrowedExclusivePtr<'_, PreSerializedValues>,
     value_ptr: CsharpValuePtr,
     value_len: usize,
-) -> FfiError {
+    constructors: &ExceptionConstructors,
+) -> FfiException {
     let Some(values) = BoxFFI::as_mut_ref(values_ptr) else {
-        return FfiError::new(
-            1,
-            CString::new("invalid PreSerializedValues pointer in pre_serialized_values_add_value")
-                .unwrap(),
-        );
+        panic!("invalid PreSerializedValues pointer in pre_serialized_values_add_value");
     };
     let value = CsharpSerializedValue::new(value_ptr, value_len);
     match unsafe { values.add_value(value) } {
-        Ok(()) => FfiError::ok(),
-        Err(e) => {
-            let msg = format!("failed to add value: {e}");
-            FfiError::new(
-                1,
-                CString::new(msg)
-                    .unwrap_or_else(|_| CString::new("invalid utf8 in error").unwrap()),
-            )
-        }
+        Ok(()) => FfiException::ok(),
+        Err(e) => FfiException::from_error(e, constructors),
     }
 }
 
@@ -46,24 +35,14 @@ pub unsafe extern "C" fn pre_serialized_values_add_value(
 #[unsafe(no_mangle)]
 pub extern "C" fn pre_serialized_values_add_null(
     values_ptr: BridgedBorrowedExclusivePtr<'_, PreSerializedValues>,
-) -> FfiError {
+    constructors: &ExceptionConstructors,
+) -> FfiException {
     let Some(values) = BoxFFI::as_mut_ref(values_ptr) else {
-        return FfiError::new(
-            1,
-            CString::new("invalid PreSerializedValues pointer in pre_serialized_values_add_null")
-                .unwrap(),
-        );
+        panic!("invalid PreSerializedValues pointer in pre_serialized_values_add_null");
     };
     match values.add_null() {
-        Ok(()) => FfiError::ok(),
-        Err(e) => {
-            let msg = format!("failed to add null: {e}");
-            FfiError::new(
-                1,
-                CString::new(msg)
-                    .unwrap_or_else(|_| CString::new("invalid utf8 in error").unwrap()),
-            )
-        }
+        Ok(()) => FfiException::ok(),
+        Err(e) => FfiException::from_error(e, constructors),
     }
 }
 
@@ -71,24 +50,14 @@ pub extern "C" fn pre_serialized_values_add_null(
 #[unsafe(no_mangle)]
 pub extern "C" fn pre_serialized_values_add_unset(
     values_ptr: BridgedBorrowedExclusivePtr<'_, PreSerializedValues>,
-) -> FfiError {
+    constructors: &ExceptionConstructors,
+) -> FfiException {
     let Some(values) = BoxFFI::as_mut_ref(values_ptr) else {
-        return FfiError::new(
-            1,
-            CString::new("invalid PreSerializedValues pointer in pre_serialized_values_add_unset")
-                .unwrap(),
-        );
+        panic!("invalid PreSerializedValues pointer in pre_serialized_values_add_unset");
     };
     match values.add_unset() {
-        Ok(()) => FfiError::ok(),
-        Err(e) => {
-            let msg = format!("failed to add unset: {e}");
-            FfiError::new(
-                1,
-                CString::new(msg)
-                    .unwrap_or_else(|_| CString::new("invalid utf8 in error").unwrap()),
-            )
-        }
+        Ok(()) => FfiException::ok(),
+        Err(e) => FfiException::from_error(e, constructors),
     }
 }
 

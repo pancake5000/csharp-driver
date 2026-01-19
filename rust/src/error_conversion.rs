@@ -1,10 +1,12 @@
-use crate::FfiPtr;
 use crate::ffi::{FFIByteSlice, FFIStr};
 use scylla::errors::{
-    ConnectionError, ConnectionPoolError, DbError, MetadataError, NewSessionError, NextPageError,
-    PagerExecutionError, PrepareError, RequestAttemptError, RequestError,
+    ConnectionError, ConnectionPoolError, DbError, DeserializationError, MetadataError,
+    NewSessionError, NextPageError, NextRowError, PagerExecutionError, PrepareError,
+    RequestAttemptError, RequestError, SerializationError,
 };
 use std::fmt::{Debug, Display};
+use std::mem::size_of;
+use std::ptr::NonNull;
 use thiserror::Error;
 
 use crate::task::ExceptionConstructors;
@@ -17,7 +19,46 @@ enum Exception {}
 /// This is used across the FFI boundary to represent exceptions created on the C# side.
 #[derive(Clone, Copy, Debug)]
 #[repr(transparent)]
-pub struct ExceptionPtr(FfiPtr<'static, Exception>);
+pub struct ExceptionPtr(NonNull<Exception>);
+
+/// Wrapper struct for returning exceptions over FFI.
+///
+/// The pointer inside this package references a GCHandle allocated on the C# side.
+/// Rust must treat this as an opaque handle and must not attempt to free it.
+/// At the managed boundary, C# must either throw (which frees) or explicitly free the handle.
+/// All changes to this struct must be mirrored in C# code in the exact same order.
+#[repr(transparent)]
+pub struct FfiException {
+    pub exception: Option<ExceptionPtr>,
+}
+
+// Compile-time assertion that `FfiException` is pointer-sized.
+// Ensures ABI compatibility with C# (opaque GCHandle/IntPtr across FFI).
+const _: [(); size_of::<FfiException>()] = [(); size_of::<*const ()>()];
+
+impl FfiException {
+    pub(crate) fn ok() -> Self {
+        Self { exception: None }
+    }
+
+    pub(crate) fn from_exception(exception: ExceptionPtr) -> Self {
+        Self {
+            exception: Some(exception),
+        }
+    }
+
+    pub(crate) fn from_error<E>(error: E, constructors: &ExceptionConstructors) -> Self
+    where
+        E: ErrorToException,
+    {
+        let exception_ptr = error.to_exception(constructors);
+        Self::from_exception(exception_ptr)
+    }
+
+    pub(crate) fn has_exception(&self) -> bool {
+        self.exception.is_some()
+    }
+}
 
 #[repr(transparent)]
 pub struct RustExceptionConstructor(unsafe extern "C" fn(message: FFIStr<'_>) -> ExceptionPtr);
@@ -209,6 +250,28 @@ impl InvalidQueryConstructor {
     }
 }
 
+pub struct SerializationExceptionConstructor(
+    unsafe extern "C" fn(message: FFIStr<'_>) -> ExceptionPtr,
+);
+
+impl SerializationExceptionConstructor {
+    pub(crate) fn construct_from_rust(&self, message: &str) -> ExceptionPtr {
+        let message = FFIStr::new(message);
+        unsafe { (self.0)(message) }
+    }
+}
+
+pub struct DeserializationExceptionConstructor(
+    unsafe extern "C" fn(message: FFIStr<'_>) -> ExceptionPtr,
+);
+
+impl DeserializationExceptionConstructor {
+    pub(crate) fn construct_from_rust(&self, message: &str) -> ExceptionPtr {
+        let message = FFIStr::new(message);
+        unsafe { (self.0)(message) }
+    }
+}
+
 // Special errors for C# wrapper.
 
 /// Wrapper enum to represent errors that may occur normally or indicate that the session has been
@@ -337,6 +400,28 @@ impl ErrorToException for (&DbError, &str) {
                 .rust_exception_constructor
                 .construct_from_rust(db_error),
         }
+    }
+}
+
+impl ErrorToException for DeserializationError {
+    fn to_exception(&self, ctors: &ExceptionConstructors) -> ExceptionPtr {
+        ctors
+            .deserialization_exception_constructor
+            .construct_from_rust(&self.to_string())
+    }
+}
+
+impl ErrorToException for NextRowError {
+    fn to_exception(&self, ctors: &ExceptionConstructors) -> ExceptionPtr {
+        ctors.rust_exception_constructor.construct_from_rust(self) // TODO: convert errors to specific exceptions
+    }
+}
+
+impl ErrorToException for SerializationError {
+    fn to_exception(&self, ctors: &ExceptionConstructors) -> ExceptionPtr {
+        ctors
+            .serialization_exception_constructor
+            .construct_from_rust(&self.to_string())
     }
 }
 

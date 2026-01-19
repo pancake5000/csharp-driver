@@ -91,6 +91,11 @@ pub struct BridgedPtr<'a, T: Sized, P: Properties> {
     _phantom: PhantomData<&'a P>,
 }
 
+// Compile-time assertion that `BridgedPtr` is pointer-sized.
+// Ensures ABI compatibility with C# (opaque GCHandle/IntPtr across FFI).
+const _: [(); std::mem::size_of::<BridgedPtr<'_, (), Shared>>()] =
+    [(); std::mem::size_of::<*const ()>()];
+
 /// Casts the pointer to a pointer to `c_void`.
 /// This is useful to accomodate for non-generics APIs,
 /// i.e., C FFI functions that accept `*mut c_void` parameters.

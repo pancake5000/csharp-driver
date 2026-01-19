@@ -8,11 +8,13 @@ use tokio::runtime::Runtime;
 
 use crate::FfiPtr;
 use crate::error_conversion::{
-    AlreadyExistsConstructor, AlreadyShutdownExceptionConstructor, ErrorToException, ExceptionPtr,
+    AlreadyExistsConstructor, AlreadyShutdownExceptionConstructor,
+    DeserializationExceptionConstructor, ErrorToException, ExceptionPtr,
     FunctionFailureExceptionConstructor, InvalidConfigurationInQueryExceptionConstructor,
     InvalidQueryConstructor, NoHostAvailableExceptionConstructor,
     OperationTimedOutExceptionConstructor, PreparedQueryNotFoundExceptionConstructor,
-    RequestInvalidExceptionConstructor, RustExceptionConstructor, SyntaxErrorExceptionConstructor,
+    RequestInvalidExceptionConstructor, RustExceptionConstructor,
+    SerializationExceptionConstructor, SyntaxErrorExceptionConstructor,
     TraceRetrievalExceptionConstructor, TruncateExceptionConstructor,
     UnauthorizedExceptionConstructor,
 };
@@ -71,6 +73,7 @@ pub struct Tcb {
 pub struct ExceptionConstructors {
     pub already_exists_constructor: AlreadyExistsConstructor,
     pub already_shutdown_exception_constructor: AlreadyShutdownExceptionConstructor,
+    pub deserialization_exception_constructor: DeserializationExceptionConstructor,
     pub function_failure_exception_constructor: FunctionFailureExceptionConstructor,
     pub invalid_configuration_in_query_constructor: InvalidConfigurationInQueryExceptionConstructor,
     pub invalid_query_constructor: InvalidQueryConstructor,
@@ -79,6 +82,7 @@ pub struct ExceptionConstructors {
     pub prepared_query_not_found_exception_constructor: PreparedQueryNotFoundExceptionConstructor,
     pub request_invalid_exception_constructor: RequestInvalidExceptionConstructor,
     pub rust_exception_constructor: RustExceptionConstructor,
+    pub serialization_exception_constructor: SerializationExceptionConstructor,
     pub syntax_error_exception_constructor: SyntaxErrorExceptionConstructor,
     pub trace_retrieval_exception_constructor: TraceRetrievalExceptionConstructor,
     pub truncate_exception_constructor: TruncateExceptionConstructor,

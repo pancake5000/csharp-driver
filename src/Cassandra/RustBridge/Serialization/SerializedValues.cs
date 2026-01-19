@@ -64,15 +64,33 @@ namespace Cassandra
         {
             if (value == null)
             {
-                FfiErrorHelpers.ExecuteAndThrowIfFails(() => pre_serialized_values_add_null(handle),
-                    "pre_serialized_values_add_null");
+                unsafe {
+                    var res = pre_serialized_values_add_null(handle, (IntPtr)RustBridgeGlobals.ConstructorsPtr);
+                    try
+                    {
+                        RustBridge.ThrowIfException(ref res);
+                    }
+                    finally
+                    {
+                        RustBridge.FreeExceptionHandle(ref res);
+                    }
+                }
                 return;
             }
             if (ReferenceEquals(value, Unset.Value))
             {
-                FfiErrorHelpers.ExecuteAndThrowIfFails(() => pre_serialized_values_add_unset(handle),
-                    "pre_serialized_values_add_unset");
-                return;
+                unsafe {
+                    var res = pre_serialized_values_add_unset(handle, (IntPtr)RustBridgeGlobals.ConstructorsPtr);
+                    try
+                    {
+                        RustBridge.ThrowIfException(ref res);
+                    }
+                    finally
+                    {
+                        RustBridge.FreeExceptionHandle(ref res);
+                    }
+                    return;
+                }
             }
             AddValue(_serializer.Serialize(value));
         }
@@ -86,11 +104,16 @@ namespace Cassandra
                     IntPtr valuePtr = (IntPtr)ptr;
                     UIntPtr valueLen = (UIntPtr)buf.Length;
                     
-                    FfiErrorHelpers.ExecuteAndThrowIfFails(() => pre_serialized_values_add_value(
-                        handle,
-                        valuePtr,
-                        valueLen)
-                    );
+                    var res = pre_serialized_values_add_value(handle, valuePtr, valueLen, (IntPtr)RustBridgeGlobals.ConstructorsPtr);
+                    try
+                    {
+                        RustBridge.ThrowIfException(ref res);
+                    }
+                    finally
+                    {
+                        RustBridge.FreeExceptionHandle(ref res);
+                    }
+
                 }
             }
         }
@@ -102,15 +125,16 @@ namespace Cassandra
         private static extern void pre_serialized_values_free(IntPtr ptr);
 
         [DllImport(NativeLibrary.CSharpWrapper, CallingConvention = CallingConvention.Cdecl)]
-        private static extern FfiError pre_serialized_values_add_unset(IntPtr valuesPtr);
+        private static extern RustBridge.FfiException pre_serialized_values_add_unset(IntPtr valuesPtr, IntPtr constructorsPtr);
 
         [DllImport(NativeLibrary.CSharpWrapper, CallingConvention = CallingConvention.Cdecl)]
-        private static extern FfiError pre_serialized_values_add_null(IntPtr valuesPtr);
+        private static extern RustBridge.FfiException pre_serialized_values_add_null(IntPtr valuesPtr, IntPtr constructorsPtr);
 
         [DllImport(NativeLibrary.CSharpWrapper, CallingConvention = CallingConvention.Cdecl)]
-        private static extern FfiError pre_serialized_values_add_value(
+        private static extern RustBridge.FfiException pre_serialized_values_add_value(
             IntPtr valuesPtr,
             IntPtr valuePtr,
-            UIntPtr valueLen);
+            UIntPtr valueLen,
+            IntPtr constructorsPtr);
     }
 }
