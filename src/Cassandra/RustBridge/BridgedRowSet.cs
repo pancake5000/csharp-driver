@@ -1,5 +1,6 @@
 using System;
-
+using System.Collections.Generic;
+using System.Net;
 using System.Runtime.CompilerServices;
 using System.Runtime.InteropServices;
 using Cassandra.Serialization;
@@ -346,6 +347,61 @@ namespace Cassandra
                 Console.Error.WriteLine($"[FFI] DeserializeValue threw exception: {ex}");
                 return FFIMaybeException.FromException(ex);
             }
+        }
+
+        // --- Coordinator / ExecutionInfo bridge ---
+
+        [DllImport("csharp_wrapper", CallingConvention = CallingConvention.Cdecl)]
+        private static extern FFIMaybeException row_set_fill_coordinators(
+            IntPtr rowSetPtr,
+            IntPtr contextPtr,
+            IntPtr addCoordinatorCallback);
+
+        unsafe static readonly delegate* unmanaged[Cdecl]<IntPtr, FFISliceRaw, ushort, FFIMaybeException> addCoordinatorPtr = &AddCoordinator;
+
+        /// <summary>
+        /// Called by Rust once per coordinator. Decodes the raw IP bytes (4 = IPv4, 16 = IPv6)
+        /// and port into an IPEndPoint and appends it to the list referenced by contextPtr.
+        /// </summary>
+        [UnmanagedCallersOnly(CallConvs = new Type[] { typeof(CallConvCdecl) })]
+        private static unsafe FFIMaybeException AddCoordinator(
+            IntPtr contextPtr,
+            FFISliceRaw ipBytes,
+            ushort port)
+        {
+            try
+            {
+                var list = Unsafe.AsRef<List<IPEndPoint>>((void*)contextPtr);
+                var ipAddress = new IPAddress(ipBytes.As<byte>().ToSpan());
+                list.Add(new IPEndPoint(ipAddress, port));
+            }
+            catch (Exception ex)
+            {
+                return FFIMaybeException.FromException(ex);
+            }
+            return FFIMaybeException.Ok();
+        }
+
+        /// <summary>
+        /// Returns every coordinator the pager has recorded so far, in query order.
+        /// For a single-page query this is exactly one entry — the queried host.
+        /// For multi-page queries there is one entry per fetched page.
+        /// </summary>
+        internal List<IPEndPoint> ExtractCoordinatorsFromRust()
+        {
+            var list = new List<IPEndPoint>();
+            unsafe
+            {
+                RunWithIncrement(handle =>
+                    row_set_fill_coordinators(
+                        handle,
+                        (IntPtr)Unsafe.AsPointer(ref list),
+                        (IntPtr)addCoordinatorPtr
+                    )
+                );
+            }
+            GC.KeepAlive(list);
+            return list;
         }
 
         internal static Type MapTypeFromCode(ColumnTypeCode code)

@@ -466,6 +466,66 @@ pub extern "C" fn row_set_type_info_get_vector_dimensions(
     }
 }
 
+// --- Coordinator / ExecutionInfo bridge ---
+
+/// Opaque type representing the C# `List<IPEndPoint>` context for coordinator accumulation.
+enum CoordinatorList {}
+
+/// Transparent wrapper around a pointer to the C# coordinator list context.
+#[derive(Clone, Copy)]
+#[repr(transparent)]
+pub struct CoordinatorListPtr(FFIPtr<'static, CoordinatorList>);
+
+/// Callback invoked once per coordinator.
+/// `ip_bytes` is 4 bytes for IPv4 or 16 bytes for IPv6; `port` is the connection port.
+/// Returns `FFIMaybeException` so C#-side errors (e.g. OOM) propagate back.
+type AddCoordinator = unsafe extern "C" fn(
+    context_ptr: CoordinatorListPtr,
+    ip_bytes: FFISlice<'_, u8>,
+    port: u16,
+) -> FFIMaybeException;
+
+/// Iterates every coordinator accumulated in the pager and calls `add_coordinator` for each.
+/// Coordinators are the nodes that served each page query, in query order.
+/// Returns immediately with the first exception produced by the callback, if any.
+#[unsafe(no_mangle)]
+pub extern "C" fn row_set_fill_coordinators(
+    row_set_ptr: BridgedBorrowedSharedPtr<'_, RowSet>,
+    context_ptr: CoordinatorListPtr,
+    add_coordinator: AddCoordinator,
+) -> FFIMaybeException {
+    let row_set = ArcFFI::as_ref(row_set_ptr).unwrap();
+    let pager = row_set.pager.lock().unwrap();
+
+    for coordinator in pager.request_coordinators() {
+        let addr = coordinator.connection_address();
+        let port = addr.port();
+
+        // Store octets on the stack so the slice lifetime is tied to this loop iteration.
+        let ip_bytes_v4: [u8; 4];
+        let ip_bytes_v6: [u8; 16];
+        let ip_bytes_slice: &[u8] = match addr.ip() {
+            std::net::IpAddr::V4(v4) => {
+                ip_bytes_v4 = v4.octets();
+                &ip_bytes_v4
+            }
+            std::net::IpAddr::V6(v6) => {
+                ip_bytes_v6 = v6.octets();
+                &ip_bytes_v6
+            }
+        };
+
+        let ffi_exception = unsafe {
+            add_coordinator(context_ptr, FFISlice::new(ip_bytes_slice), port)
+        };
+        if ffi_exception.has_exception() {
+            return ffi_exception;
+        }
+    }
+
+    FFIMaybeException::ok()
+}
+
 pub(crate) fn column_type_to_code(typ: &ColumnType) -> u8 {
     match typ {
         ColumnType::Native(nt) => match nt {

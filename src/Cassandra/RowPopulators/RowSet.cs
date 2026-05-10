@@ -122,6 +122,7 @@ namespace Cassandra
             Columns = bridgedRowSet.ExtractColumnsFromRust();
             _exhausted = Columns.Length == 0;
             Info = new ExecutionInfo();
+            Info.SetTriedHosts(bridgedRowSet.ExtractCoordinatorsFromRust());
             _genericSerializer = serializerManager?.GetGenericSerializer() ?? new GenericSerializer();
         }
 
