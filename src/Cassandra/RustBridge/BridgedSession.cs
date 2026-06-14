@@ -91,6 +91,9 @@ namespace Cassandra
             PreparedStatementExecutionOptions executionOptions);
 
         [DllImport(NativeLibrary.CSharpWrapper, CallingConvention = CallingConvention.Cdecl)]
+        unsafe private static extern void session_batch(Tcb<ManuallyDestructible> tcb, IntPtr session, IntPtr batch);
+
+        [DllImport(NativeLibrary.CSharpWrapper, CallingConvention = CallingConvention.Cdecl)]
         unsafe private static extern FFIMaybeException session_get_keyspace(IntPtr session, IntPtr writeToStr, IntPtr context, IntPtr constructorsPtr);
 
         /// <summary>
@@ -323,6 +326,22 @@ namespace Cassandra
                     (IntPtr)SerializationHandler.PopulateValuesPtr,
                     executionOptions));
             GC.KeepAlive(populateCtx);
+            return task;
+        }
+
+        /// <summary>
+        /// Executes a batch that was assembled via <see cref="BridgedBatch"/>.
+        /// Batches return no rows, so the completed task yields an empty result
+        /// resource that the caller disposes.
+        /// </summary>
+        /// <param name="batch">The assembled batch to execute.</param>
+        internal Task<ManuallyDestructible> Batch(BridgedBatch batch)
+        {
+            // session_batch clones the batch's Arc synchronously before spawning, so the
+            // batch handle only needs to stay valid for the duration of the native call.
+            IntPtr batchHandle = batch.DangerousGetHandle();
+            var task = RunAsyncWithIncrement<ManuallyDestructible>((tcb, ptr) => session_batch(tcb, ptr, batchHandle));
+            GC.KeepAlive(batch);
             return task;
         }
 
