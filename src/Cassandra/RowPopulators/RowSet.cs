@@ -134,7 +134,9 @@ namespace Cassandra
             bridgedRowSet = null;
             Info = new ExecutionInfo();
             Columns = new CqlColumn[0];
-            AutoPage = true;
+            // AutoPage is intentionally not set: its setter is a not-yet-implemented
+            // stub (paging is not bridged), and an empty RowSet is already marked
+            // exhausted below, so it never needs paging.
             _exhausted = true;
             _genericSerializer = new GenericSerializer();
         }

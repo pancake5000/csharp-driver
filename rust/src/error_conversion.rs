@@ -1,8 +1,9 @@
 use crate::ffi::{FFIGCHandle, FFIMaybeGCHandle, FFISlice, FFIStr};
 use scylla::errors::{
     BadKeyspaceName, ConnectionError, ConnectionPoolError, DbError, DeserializationError,
-    MetadataError, NewSessionError, NextPageError, NextRowError, PagerExecutionError, PrepareError,
-    RequestAttemptError, RequestError, SerializationError, TypeCheckError, UseKeyspaceError,
+    ExecutionError, MetadataError, NewSessionError, NextPageError, NextRowError,
+    PagerExecutionError, PrepareError, RequestAttemptError, RequestError, SerializationError,
+    TypeCheckError, UseKeyspaceError,
 };
 use std::fmt::{Debug, Display};
 use std::mem::size_of;
@@ -391,6 +392,29 @@ impl ErrorToException for PagerExecutionError {
             }
 
             PagerExecutionError::MetadataError(e) => e.to_exception(ctors),
+
+            _ => ctors.rust_exception_constructor.construct_from_rust(&self),
+        }
+    }
+}
+
+// Specific mapping for ExecutionError (returned by e.g. `Session::batch`).
+impl ErrorToException for ExecutionError {
+    fn to_exception(self, ctors: &ExceptionConstructors) -> FFIException {
+        match self {
+            ExecutionError::PrepareError(e) => e.to_exception(ctors),
+
+            ExecutionError::ConnectionPoolError(e) => e.to_exception(ctors),
+
+            ExecutionError::LastAttemptError(e) => e.to_exception(ctors),
+
+            ExecutionError::UseKeyspaceError(e) => e.to_exception(ctors),
+
+            ExecutionError::MetadataError(e) => e.to_exception(ctors),
+
+            ExecutionError::RequestTimeout(duration) => ctors
+                .operation_timed_out_exception_constructor
+                .construct_from_rust(duration.as_millis().clamp(0, i32::MAX as u128) as i32),
 
             _ => ctors.rust_exception_constructor.construct_from_rust(&self),
         }

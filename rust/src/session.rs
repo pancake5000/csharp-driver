@@ -4,11 +4,12 @@ use std::sync::RwLock as StdRwLock;
 
 use scylla::client::session::Session;
 use scylla::cluster::ClusterState;
-use scylla::errors::{NewSessionError, PagerExecutionError, PrepareError};
+use scylla::errors::{ExecutionError, NewSessionError, PagerExecutionError, PrepareError};
 use scylla::statement::Statement;
 use scylla_cql::serialize::row::SerializedValues;
 use tokio::sync::RwLock;
 
+use crate::batch::BridgedBatch;
 use crate::error_conversion::{FFIMaybeException, SessionOperationError};
 use crate::ffi::{
     ArcFFI, BridgedBorrowedSharedPtr, BridgedOwnedSharedPtr, CSharpManagedStringPtr, CSharpStr,
@@ -503,6 +504,67 @@ pub extern "C" fn session_query_bound_with_values(
         Ok(Arc::new(RowSet {
             pager: tokio::sync::Mutex::new(query_pager),
         }))
+    });
+}
+
+/// Executes a batch that was assembled by C# via `batch_create` / `batch_append_*`.
+///
+/// Batches return no rows (the MVP discards the `QueryResult`), so the task
+/// completes with an empty result the same way `session_shutdown` does. The
+/// caller receives an empty `ManuallyDestructible` to dispose.
+#[unsafe(no_mangle)]
+pub extern "C" fn session_batch(
+    tcb: Tcb<ManuallyDestructible>,
+    session_ptr: BridgedBorrowedSharedPtr<'_, BridgedSession>,
+    batch_ptr: BridgedBorrowedSharedPtr<'_, BridgedBatch>,
+) {
+    let session_arc = ArcFFI::cloned_from_ptr(session_ptr).unwrap();
+    let batch_arc = ArcFFI::cloned_from_ptr(batch_ptr).unwrap();
+
+    tracing::trace!("[FFI] Scheduling batch execution");
+
+    // Try to acquire an owned read lock.
+    // If the operation fails, treat it as session shutting down.
+    let session_guard_res = session_arc.try_read_owned();
+
+    BridgedFuture::spawn::<_, _, SessionOperationError<ExecutionError>, _>(tcb, async move {
+        tracing::debug!("[FFI] Executing batch");
+
+        let Ok(session_guard) = session_guard_res else {
+            // Session is currently shutting down - exit with appropriate error.
+            return Err(SessionOperationError::AlreadyShutdown);
+        };
+
+        // Check if session is connected or if it has been shut down.
+        // If it has been shut down, return appropriate error.
+        let Some(session) = session_guard.session.as_ref() else {
+            return Err(SessionOperationError::AlreadyShutdown);
+        };
+
+        // Clone the assembled batch and its values out of the shared handle so
+        // they can be moved into (and outlive) this async task.
+        let (batch, values) = {
+            let guard = batch_arc
+                .inner
+                .lock()
+                .expect("poisoning impossible due to process-aborting panics");
+            (guard.batch.clone(), guard.values.clone())
+        };
+
+        // Execute the batch with the already-serialized values, avoiding a
+        // re-serialization round-trip. The QueryResult is intentionally
+        // discarded: batches return no rows in this MVP (conditional/LWT
+        // batches lose their `[applied]` column until the materialized-result
+        // path is bridged).
+        let _result = session
+            .batch_preserialized(&batch, &values)
+            .await
+            .map_err(SessionOperationError::Inner)?;
+
+        tracing::trace!("[FFI] Batch executed");
+
+        // Return an empty result, providing the type just to satisfy the type constraints.
+        Ok(None::<Arc<EmptyBridgedResult>>)
     });
 }
 

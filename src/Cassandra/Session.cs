@@ -367,11 +367,80 @@ namespace Cassandra
                     }
 
                 case BatchStatement s:
-                    throw new NotImplementedException("Batches are not yet supported");
+                    return ExecuteBatchAsync(s);
 
                 default:
                     throw new ArgumentException("Unsupported statement type");
             }
+        }
+
+        /// <summary>
+        /// Assembles the batch on the Rust side and executes it. Batches return no rows,
+        /// so the result is an empty <see cref="RowSet"/>.
+        /// </summary>
+        /// <remarks>
+        /// Note: conditional (LWT) batches normally return an <c>[applied]</c> column.
+        /// That row is not yet surfaced here because the unpaged result path is not
+        /// bridged; the batch still executes and applies as expected.
+        /// </remarks>
+        private Task<RowSet> ExecuteBatchAsync(BatchStatement batch)
+        {
+            var serializer = _serializerManager.GetCurrentSerializer();
+            var bridgedBatch = BridgedBatch.Create(batch.BatchType);
+
+            bool assembled = false;
+            try
+            {
+                foreach (var child in batch.Queries)
+                {
+                    switch (child)
+                    {
+                        case BoundStatement bound:
+                            // The managed PreparedStatement is rooted by `bound` for the duration
+                            // of the synchronous append, so the native handle stays valid.
+                            IntPtr prepared = bound.PreparedStatement.bridgedPreparedStatement.DangerousGetHandle();
+                            bridgedBatch.AppendPrepared(prepared, bound.QueryValues ?? [], serializer);
+                            GC.KeepAlive(bound.PreparedStatement);
+                            break;
+
+                        case SimpleStatement simple:
+                            bridgedBatch.AppendSimple(simple.QueryString, simple.QueryValues ?? [], serializer);
+                            break;
+
+                        default:
+                            throw new ArgumentException($"Unsupported statement type in batch: {child.GetType().Name}");
+                    }
+                }
+
+                assembled = true;
+            }
+            finally
+            {
+                // If assembling threw, free the partially-built batch now; otherwise it is
+                // freed in the continuation once execution completes.
+                if (!assembled)
+                {
+                    bridgedBatch.Dispose();
+                }
+            }
+
+            return bridgedSession.Batch(bridgedBatch).ContinueWith(t =>
+            {
+                try
+                {
+                    // Use GetAwaiter().GetResult() to unwrap AggregateException
+                    // and throw the inner exception directly, avoiding double-wrapping.
+                    RustBridge.ManuallyDestructible mdEmpty = t.GetAwaiter().GetResult();
+
+                    // The batch returns no rows: dispose the empty result and return an empty RowSet.
+                    new EmptyRustResource(mdEmpty).Dispose();
+                    return new RowSet();
+                }
+                finally
+                {
+                    bridgedBatch.Dispose();
+                }
+            }, TaskContinuationOptions.ExecuteSynchronously);
         }
 
         public IDriverMetrics GetMetrics()

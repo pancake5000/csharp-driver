@@ -1,3 +1,4 @@
+mod batch;
 mod error_conversion;
 pub mod ffi;
 pub mod logging;
