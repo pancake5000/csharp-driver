@@ -3,7 +3,9 @@ use std::task::Poll;
 use scylla::client::pager::QueryPager;
 use scylla::cluster::metadata::CollectionType;
 use scylla::deserialize::FrameSlice;
-use scylla::frame::response::result::{ColumnType, NativeType};
+use scylla::errors::NextRowError;
+use scylla::frame::response::result::{ColumnSpec, ColumnType, NativeType};
+use scylla_cql::deserialize::result::RawRowLendingIterator;
 
 use crate::error_conversion::{ErrorToException as _, FFIException, FFIMaybeException};
 use crate::ffi::{
@@ -13,7 +15,7 @@ use crate::ffi::{
 use crate::task::{BridgedFuture, ExceptionConstructors, Tcb};
 
 #[derive(Debug)]
-pub(crate) struct RowSet {
+pub(crate) enum RowSet {
     // FIXME: consider if this Mutex is necessary. Perhaps BoxFFI is a better fit?
     //
     // Rust explanation:
@@ -24,7 +26,20 @@ pub(crate) struct RowSet {
     // and it's possible that C# code will call row_set_next_row concurrently,
     // because RowSet claims it supports parallel enumeration, and does not enforce any locking
     // on its own.
-    pub(crate) pager: tokio::sync::Mutex<QueryPager>,
+    /// A paged result backed by a [`QueryPager`]. Rows are streamed from the
+    /// server page-by-page; advancing across a page boundary may await network I/O.
+    Paged(tokio::sync::Mutex<QueryPager>),
+    /// A fully-materialized, unpaged result (`query_unpaged` / `execute_unpaged`).
+    /// All rows are already in memory inside the [`RawRowLendingIterator`].
+    ///
+    /// The Mutex is needed for the same two reasons as in the `Paged` case:
+    /// `RawRowLendingIterator::next` takes `&mut self`, so we need interior
+    /// mutability over the shared (`Arc`-held) RowSet; and C# may call
+    /// `row_set_next_row` concurrently, so accesses must be serialized.
+    /// Unlike the paged case, advancing here is pure in-memory work that never
+    /// awaits network I/O, so the guard is never held across an `.await` and a
+    /// cheap synchronous `std::sync::Mutex` suffices (no async Mutex required).
+    Materialized(std::sync::Mutex<RawRowLendingIterator>),
 }
 
 impl FFI for RowSet {
@@ -41,9 +56,17 @@ pub extern "C" fn row_set_get_columns_count(
     out_num_fields: *mut usize,
 ) -> FFIMaybeException {
     let row_set = ArcFFI::as_ref(row_set_ptr).unwrap();
-    let pager = row_set.pager.blocking_lock();
+    let count = match row_set {
+        RowSet::Paged(pager) => pager.blocking_lock().column_specs().len(),
+        RowSet::Materialized(iter) => iter
+            .lock()
+            .expect("poisoning impossible due to process-aborting panics")
+            .metadata()
+            .col_specs()
+            .len(),
+    };
     unsafe {
-        *out_num_fields = pager.column_specs().len();
+        *out_num_fields = count;
     }
     FFIMaybeException::ok()
 }
@@ -72,10 +95,33 @@ pub extern "C" fn row_set_fill_columns_metadata(
     set_metadata: SetMetadata,
 ) -> FFIMaybeException {
     let row_set = ArcFFI::as_ref(row_set_ptr).unwrap();
-    let pager = row_set.pager.blocking_lock();
+    match row_set {
+        RowSet::Paged(pager) => {
+            let pager = pager.blocking_lock();
+            fill_columns_metadata_from_specs(
+                pager.column_specs().as_slice(),
+                columns_ptr,
+                set_metadata,
+            )
+        }
+        RowSet::Materialized(iter) => {
+            let iter = iter
+                .lock()
+                .expect("poisoning impossible due to process-aborting panics");
+            fill_columns_metadata_from_specs(iter.metadata().col_specs(), columns_ptr, set_metadata)
+        }
+    }
+}
 
-    // Iterate column specs and call the metadata setter
-    for (i, spec) in pager.column_specs().iter().enumerate() {
+/// Iterates the given column specs and calls back into C# for each one.
+/// Shared by both `RowSet` variants - the only thing that differs between
+/// paged and materialized results is how the `&[ColumnSpec]` slice is obtained.
+fn fill_columns_metadata_from_specs(
+    specs: &[ColumnSpec<'_>],
+    columns_ptr: FFINonNullPtr<'_, Columns>,
+    set_metadata: SetMetadata,
+) -> FFIMaybeException {
+    for (i, spec) in specs.iter().enumerate() {
         let name = FFIStr::new(spec.name());
         let keyspace = FFIStr::new(spec.table_spec().ks_name());
         let table = FFIStr::new(spec.table_spec().table_name());
@@ -224,6 +270,48 @@ fn deserialize_next_row(
     Ok(true)
 }
 
+/// Paged variant of the synchronous fast path. Returns `None` if the row cannot
+/// be produced without awaiting (lock contended, or the next page needs fetching).
+fn paged_try_next_row_sync(
+    pager: &tokio::sync::Mutex<QueryPager>,
+    deser: impl FnMut(usize, FrameSlice<'_>) -> FFIMaybeException,
+    constructors: &'static ExceptionConstructors,
+) -> Option<Result<bool, FFIException>> {
+    let mut pager = pager.try_lock().ok()?;
+
+    let num_columns = pager.column_specs().len();
+    let mut fut = std::pin::pin!(pager.next_column_iterator());
+    let noop_waker = futures::task::noop_waker();
+    let mut cx = std::task::Context::from_waker(&noop_waker);
+
+    let Poll::Ready(next) = fut.as_mut().poll(&mut cx) else {
+        return None;
+    };
+
+    Some(deserialize_next_row(next, num_columns, deser, constructors))
+}
+
+/// Materialized variant of the synchronous fast path. Rows are already in memory,
+/// so this only returns `None` if the lock is momentarily contended - never for a
+/// page fetch.
+fn materialized_try_next_row_sync(
+    iter: &std::sync::Mutex<RawRowLendingIterator>,
+    deser: impl FnMut(usize, FrameSlice<'_>) -> FFIMaybeException,
+    constructors: &'static ExceptionConstructors,
+) -> Option<Result<bool, FFIException>> {
+    let mut iter = iter.try_lock().ok()?;
+
+    let num_columns = iter.metadata().col_specs().len();
+    // Adapt RawRowLendingIterator::next() to the shape deserialize_next_row
+    // expects (the same conversion QueryPager::next() performs internally).
+    let next = iter.next().map(|res| {
+        res.map(|column_iterator| (column_iterator, false))
+            .map_err(NextRowError::RowDeserializationError)
+    });
+
+    Some(deserialize_next_row(next, num_columns, deser, constructors))
+}
+
 /// Synchronous fast path: attempts to read and deserialize the next row
 /// without spawning a tokio task.
 ///
@@ -252,35 +340,31 @@ pub extern "C" fn row_set_try_next_row_sync(
 ) -> FFIMaybeException {
     let row_set = ArcFFI::as_ref(row_set_ptr).unwrap();
 
-    let Ok(mut pager) = row_set.pager.try_lock() else {
-        *out_result = SyncNextRowResult::NeedAsync;
-        return FFIMaybeException::ok();
+    let deser = |value_index: usize, slice: FrameSlice<'_>| unsafe {
+        deserialize_value(
+            columns_ptr,
+            values_ptr,
+            value_index,
+            serializer_ptr,
+            FFISlice::new(slice.as_slice()),
+        )
     };
 
-    let num_columns = pager.column_specs().len();
-    let mut fut = std::pin::pin!(pager.next_column_iterator());
-    let noop_waker = futures::task::noop_waker();
-    let mut cx = std::task::Context::from_waker(&noop_waker);
-
-    let Poll::Ready(next) = fut.as_mut().poll(&mut cx) else {
-        *out_result = SyncNextRowResult::NeedAsync;
-        return FFIMaybeException::ok();
+    // `None` means the row could not be produced synchronously and the caller
+    // should fall back to the async path (lock contended, or - for paged
+    // results - the next page must be fetched from the server).
+    let outcome = match row_set {
+        RowSet::Paged(pager) => paged_try_next_row_sync(pager, deser, constructors),
+        RowSet::Materialized(iter) => materialized_try_next_row_sync(iter, deser, constructors),
     };
 
-    let result = deserialize_next_row(
-        next,
-        num_columns,
-        |value_index, slice| unsafe {
-            deserialize_value(
-                columns_ptr,
-                values_ptr,
-                value_index,
-                serializer_ptr,
-                FFISlice::new(slice.as_slice()),
-            )
-        },
-        constructors,
-    );
+    let result = match outcome {
+        Some(result) => result,
+        None => {
+            *out_result = SyncNextRowResult::NeedAsync;
+            return FFIMaybeException::ok();
+        }
+    };
 
     match result {
         Ok(got_row) => {
@@ -293,6 +377,79 @@ pub extern "C" fn row_set_try_next_row_sync(
         }
         Err(exception) => FFIMaybeException::from_exception(exception),
     }
+}
+
+/// Paged variant of the async path: locks the pager (awaiting if needed) and
+/// fetches the next page from the server if the current one is exhausted.
+///
+/// Takes ownership of the GC handles: an owned `FFIGCHandle` is `Send` (so it may
+/// be held across `.await`), whereas a borrow of it is not, so the deserialization
+/// closure that borrows them must be built after the awaits.
+async fn paged_next_row_async(
+    pager: &tokio::sync::Mutex<QueryPager>,
+    deserialize_value: DeserializeValue,
+    columns_handle: FFIGCHandle<Columns>,
+    values_handle: FFIGCHandle<Values>,
+    serializer_handle: FFIGCHandle<Serializer>,
+    constructors: &'static ExceptionConstructors,
+) -> Result<bool, FFIException> {
+    let mut pager = pager.lock().await;
+    let num_columns = pager.column_specs().len();
+
+    let next = pager.next_column_iterator().await;
+
+    deserialize_next_row(
+        next,
+        num_columns,
+        |value_index, frame_slice| unsafe {
+            deserialize_value(
+                columns_handle.borrow(),
+                values_handle.borrow(),
+                value_index,
+                serializer_handle.borrow(),
+                FFISlice::new(frame_slice.as_slice()),
+            )
+        },
+        constructors,
+    )
+}
+
+/// Materialized variant of the async path. Rows are already in memory, so this
+/// never actually awaits; it exists so the async entry point can treat both
+/// variants uniformly when the sync fast path defers due to lock contention.
+fn materialized_next_row(
+    iter: &std::sync::Mutex<RawRowLendingIterator>,
+    deserialize_value: DeserializeValue,
+    columns_handle: FFIGCHandle<Columns>,
+    values_handle: FFIGCHandle<Values>,
+    serializer_handle: FFIGCHandle<Serializer>,
+    constructors: &'static ExceptionConstructors,
+) -> Result<bool, FFIException> {
+    let mut iter = iter
+        .lock()
+        .expect("poisoning impossible due to process-aborting panics");
+    let num_columns = iter.metadata().col_specs().len();
+    // Adapt RawRowLendingIterator::next() to the shape deserialize_next_row
+    // expects (the same conversion QueryPager::next() performs internally).
+    let next = iter.next().map(|res| {
+        res.map(|column_iterator| (column_iterator, false))
+            .map_err(NextRowError::RowDeserializationError)
+    });
+
+    deserialize_next_row(
+        next,
+        num_columns,
+        |value_index, frame_slice| unsafe {
+            deserialize_value(
+                columns_handle.borrow(),
+                values_handle.borrow(),
+                value_index,
+                serializer_handle.borrow(),
+                FFISlice::new(frame_slice.as_slice()),
+            )
+        },
+        constructors,
+    )
 }
 
 /// Async path: spawns a tokio task to read and deserialize the next row.
@@ -311,25 +468,27 @@ pub extern "C" fn row_set_next_row_async<'row_set>(
 ) {
     let row_set = ArcFFI::cloned_from_ptr(row_set_ptr).unwrap();
     BridgedFuture::spawn(tcb, async move {
-        let mut pager = row_set.pager.lock().await;
-        let num_columns = pager.column_specs().len();
-
-        let next = pager.next_column_iterator().await;
-
-        deserialize_next_row(
-            next,
-            num_columns,
-            |value_index, frame_slice| unsafe {
-                deserialize_value(
-                    columns_handle.borrow(),
-                    values_handle.borrow(),
-                    value_index,
-                    serializer_handle.borrow(),
-                    FFISlice::new(frame_slice.as_slice()),
+        match row_set.as_ref() {
+            RowSet::Paged(pager) => {
+                paged_next_row_async(
+                    pager,
+                    deserialize_value,
+                    columns_handle,
+                    values_handle,
+                    serializer_handle,
+                    constructors,
                 )
-            },
-            constructors,
-        )
+                .await
+            }
+            RowSet::Materialized(iter) => materialized_next_row(
+                iter,
+                deserialize_value,
+                columns_handle,
+                values_handle,
+                serializer_handle,
+                constructors,
+            ),
+        }
     });
 }
 

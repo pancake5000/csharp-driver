@@ -265,35 +265,55 @@ namespace Cassandra
                         ushort consistencyLevel = s.ConsistencyLevel.HasValue ? (ushort)s.ConsistencyLevel.Value : (ushort)999;
                         bool isIdempotent = s.IsIdempotent ?? Configuration.QueryOptions.GetDefaultIdempotence();
                         int pageSize = s.PageSize <= 0 ? Configuration.QueryOptions.GetPageSize() : s.PageSize;
-                        if (pageSize == int.MaxValue)
-                        {
-                            throw new NotImplementedException(
-                                "Disabling paging (PageSize == int.MaxValue) is not yet supported. " +
-                                "This requires using the Rust driver's unpaged query API, which is not yet bridged.");
-                        }
 
                         Task<RustBridge.ManuallyDestructible> task;
-                        if (queryValues.Length == 0)
+                        if (pageSize == int.MaxValue)
                         {
-                            task = bridgedSession.Query(
-                                queryString,
-                                hasConsistencyLevel,
-                                consistencyLevel,
-                                isIdempotent,
-                                pageSize
-                            );
+                            if (queryValues.Length == 0)
+                            {
+                                task = bridgedSession.QueryUnpaged(
+                                    queryString,
+                                    hasConsistencyLevel,
+                                    consistencyLevel,
+                                    isIdempotent
+                                );
+                            }
+                            else
+                            {
+                                task = bridgedSession.QueryWithValuesUnpaged(
+                                    queryString,
+                                    queryValues,
+                                    _serializerManager.GetCurrentSerializer(),
+                                    hasConsistencyLevel,
+                                    consistencyLevel,
+                                    isIdempotent
+                                );
+                            }
                         }
                         else
                         {
-                            task = bridgedSession.QueryWithValues(
-                                queryString,
-                                queryValues,
-                                _serializerManager.GetCurrentSerializer(),
-                                hasConsistencyLevel,
-                                consistencyLevel,
-                                isIdempotent,
-                                pageSize
-                            );
+                            if (queryValues.Length == 0)
+                            {
+                                task = bridgedSession.Query(
+                                    queryString,
+                                    hasConsistencyLevel,
+                                    consistencyLevel,
+                                    isIdempotent,
+                                    pageSize
+                                );
+                            }
+                            else
+                            {
+                                task = bridgedSession.QueryWithValues(
+                                    queryString,
+                                    queryValues,
+                                    _serializerManager.GetCurrentSerializer(),
+                                    hasConsistencyLevel,
+                                    consistencyLevel,
+                                    isIdempotent,
+                                    pageSize
+                                );
+                            }
                         }
 
                         return task.ContinueWith(t =>
@@ -301,9 +321,9 @@ namespace Cassandra
                             // Use GetAwaiter().GetResult() to unwrap AggregateException
                             // and throw the inner exception directly, avoiding double-wrapping.
                             RustBridge.ManuallyDestructible mdRowSet = t.GetAwaiter().GetResult();
-                            var rowSet = new RowSet(mdRowSet, _serializerManager);
-
-                            return rowSet;
+                            if (mdRowSet.Ptr == IntPtr.Zero)
+                                return new RowSet();
+                            return new RowSet(mdRowSet, _serializerManager);
                         }, TaskContinuationOptions.ExecuteSynchronously);
                     }
 
@@ -318,12 +338,6 @@ namespace Cassandra
                         // When the idempotence property is null, the driver will use the default value from QueryOptions.GetDefaultIdempotence().
                         bool isIdempotent = bs.IsIdempotent ?? Configuration.QueryOptions.GetDefaultIdempotence();
                         int pageSize = bs.PageSize <= 0 ? Configuration.QueryOptions.GetPageSize() : bs.PageSize;
-                        if (pageSize == int.MaxValue)
-                        {
-                            throw new NotImplementedException(
-                                "Disabling paging (PageSize == int.MaxValue) is not yet supported. " +
-                                "This requires using the Rust driver's unpaged query API, which is not yet bridged.");
-                        }
 
                         // The managed PreparedStatement object (and the BoundStatement that
                         // references it) is rooted here by the local variable `bs`. Because there's an
@@ -334,27 +348,53 @@ namespace Cassandra
                         object[] queryValuesBound = bs.QueryValues ?? [];
 
                         Task<RustBridge.ManuallyDestructible> boundTask;
-                        if (queryValuesBound.Length == 0)
+                        if (pageSize == int.MaxValue)
                         {
-                            boundTask = bridgedSession.QueryBound(
-                                queryPrepared,
-                                hasConsistencyLevel,
-                                consistencyLevel,
-                                isIdempotent,
-                                pageSize
-                            );
+                            if (queryValuesBound.Length == 0)
+                            {
+                                boundTask = bridgedSession.QueryBoundUnpaged(
+                                    queryPrepared,
+                                    hasConsistencyLevel,
+                                    consistencyLevel,
+                                    isIdempotent
+                                );
+                            }
+                            else
+                            {
+                                boundTask = bridgedSession.QueryBoundWithValuesUnpaged(
+                                    queryPrepared,
+                                    queryValuesBound,
+                                    _serializerManager.GetCurrentSerializer(),
+                                    hasConsistencyLevel,
+                                    consistencyLevel,
+                                    isIdempotent
+                                );
+                            }
                         }
                         else
                         {
-                            boundTask = bridgedSession.QueryBoundWithValues(
-                                queryPrepared,
-                                queryValuesBound,
-                                _serializerManager.GetCurrentSerializer(),
-                                hasConsistencyLevel,
-                                consistencyLevel,
-                                isIdempotent,
-                                pageSize
-                            );
+                            if (queryValuesBound.Length == 0)
+                            {
+                                boundTask = bridgedSession.QueryBound(
+                                    queryPrepared,
+                                    hasConsistencyLevel,
+                                    consistencyLevel,
+                                    isIdempotent,
+                                    pageSize
+                                );
+                            }
+                            else
+                            {
+                                boundTask = bridgedSession.QueryBoundWithValues(
+                                    queryPrepared,
+                                    queryValuesBound,
+                                    _serializerManager.GetCurrentSerializer(),
+                                    hasConsistencyLevel,
+                                    consistencyLevel,
+                                    isIdempotent,
+                                    pageSize
+                                );
+                            }
                         }
 
                         return boundTask.ContinueWith(t =>
@@ -362,6 +402,8 @@ namespace Cassandra
                             // Use GetAwaiter().GetResult() to unwrap AggregateException
                             // and throw the inner exception directly, avoiding double-wrapping.
                             RustBridge.ManuallyDestructible mdRowSet = t.GetAwaiter().GetResult();
+                            if (mdRowSet.Ptr == IntPtr.Zero)
+                                return new RowSet();
                             return new RowSet(mdRowSet, _serializerManager);
                         }, TaskContinuationOptions.ExecuteSynchronously);
                     }

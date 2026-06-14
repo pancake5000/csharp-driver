@@ -40,3 +40,10 @@ uuid = "1"
 unsafe-op-in-unsafe-fn = "warn"
 unnameable_types = "warn"
 # unreachable_pub = "warn"
+
+# Dev-only: build against the local scylla-rust-driver checkout instead of the
+# pinned git revision, so fork edits are picked up by `make build-rust` without
+# a commit/push round-trip. Do not commit this block.
+[patch."https://github.com/scylladb-zpp-2025-csharp-rs-driver/scylla-rust-driver.git"]
+scylla = { path = "/home/cockpi/scylla/scylla-rust-driver/scylla" }
+scylla-cql = { path = "/home/cockpi/scylla/scylla-rust-driver/scylla-cql" }
