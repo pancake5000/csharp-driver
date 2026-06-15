@@ -783,9 +783,8 @@ pub extern "C" fn session_query_bound_with_values_unpaged(
 
 /// Executes a batch that was assembled by C# via `batch_create` / `batch_append_*`.
 ///
-/// Batches return no rows (the MVP discards the `QueryResult`), so the task
-/// completes with an empty result the same way `session_shutdown` does. The
-/// caller receives an empty `ManuallyDestructible` to dispose.
+/// Returns the batch result as a materialized `RowSet` (for conditional/LWT
+/// batches that include an `[applied]` row) or `None` for regular batches.
 #[unsafe(no_mangle)]
 pub extern "C" fn session_batch(
     tcb: Tcb<ManuallyDestructible>,
@@ -825,20 +824,14 @@ pub extern "C" fn session_batch(
             (guard.batch.clone(), guard.values.clone())
         };
 
-        // Execute the batch with the already-serialized values, avoiding a
-        // re-serialization round-trip. The QueryResult is intentionally
-        // discarded: batches return no rows in this MVP (conditional/LWT
-        // batches lose their `[applied]` column until the materialized-result
-        // path is bridged).
-        let _result = session
+        let result = session
             .batch_preserialized(&batch, &values)
             .await
             .map_err(SessionOperationError::Inner)?;
 
         tracing::trace!("[FFI] Batch executed");
 
-        // Return an empty result, providing the type just to satisfy the type constraints.
-        Ok(None::<Arc<EmptyBridgedResult>>)
+        Ok(query_result_to_materialized_row_set(result))
     });
 }
 

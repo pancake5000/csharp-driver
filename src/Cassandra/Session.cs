@@ -470,13 +470,10 @@ namespace Cassandra
             {
                 try
                 {
-                    // Use GetAwaiter().GetResult() to unwrap AggregateException
-                    // and throw the inner exception directly, avoiding double-wrapping.
-                    RustBridge.ManuallyDestructible mdEmpty = t.GetAwaiter().GetResult();
-
-                    // The batch returns no rows: dispose the empty result and return an empty RowSet.
-                    new EmptyRustResource(mdEmpty).Dispose();
-                    return new RowSet();
+                    RustBridge.ManuallyDestructible mdRowSet = t.GetAwaiter().GetResult();
+                    if (mdRowSet.Ptr == IntPtr.Zero)
+                        return new RowSet();
+                    return new RowSet(mdRowSet, _serializerManager);
                 }
                 finally
                 {
