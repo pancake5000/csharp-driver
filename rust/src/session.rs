@@ -4,11 +4,13 @@ use std::sync::RwLock as StdRwLock;
 
 use scylla::client::session::Session;
 use scylla::cluster::ClusterState;
-use scylla::errors::{NewSessionError, PagerExecutionError, PrepareError};
+use scylla::errors::{ExecutionError, NewSessionError, PagerExecutionError, PrepareError};
 use scylla::statement::Statement;
+use scylla_cql::deserialize::result::RawRowLendingIterator;
 use scylla_cql::serialize::row::SerializedValues;
 use tokio::sync::RwLock;
 
+use crate::batch::BridgedBatch;
 use crate::error_conversion::{FFIMaybeException, SessionOperationError};
 use crate::ffi::{
     ArcFFI, BridgedBorrowedSharedPtr, BridgedOwnedSharedPtr, CSharpManagedStringPtr, CSharpStr,
@@ -196,9 +198,9 @@ pub extern "C" fn session_query(
 
         tracing::trace!("[FFI] Statement executed");
 
-        Ok(Arc::new(RowSet {
-            pager: tokio::sync::Mutex::new(query_pager),
-        }))
+        Ok(Arc::new(RowSet::Paged(tokio::sync::Mutex::new(
+            query_pager,
+        ))))
     });
 }
 
@@ -284,9 +286,9 @@ pub extern "C" fn session_query_with_values(
 
         tracing::trace!("[FFI] Prepared statement executed with pre-serialized values");
 
-        Ok(Arc::new(RowSet {
-            pager: tokio::sync::Mutex::new(query_pager),
-        }))
+        Ok(Arc::new(RowSet::Paged(tokio::sync::Mutex::new(
+            query_pager,
+        ))))
     });
 }
 
@@ -411,9 +413,9 @@ pub extern "C" fn session_query_bound(
 
         tracing::trace!("[FFI] Prepared statement executed");
 
-        Ok(Arc::new(RowSet {
-            pager: tokio::sync::Mutex::new(query_pager),
-        }))
+        Ok(Arc::new(RowSet::Paged(tokio::sync::Mutex::new(
+            query_pager,
+        ))))
     })
 }
 
@@ -500,9 +502,336 @@ pub extern "C" fn session_query_bound_with_values(
 
         tracing::trace!("[FFI] Prepared statement executed");
 
-        Ok(Arc::new(RowSet {
-            pager: tokio::sync::Mutex::new(query_pager),
-        }))
+        Ok(Arc::new(RowSet::Paged(tokio::sync::Mutex::new(
+            query_pager,
+        ))))
+    });
+}
+
+/// Converts a `QueryResult` into a `RowSet::Materialized`, or `None` if the
+/// result contained no rows (e.g. DDL / DML statements).
+fn query_result_to_materialized_row_set(
+    result: scylla::response::query_result::QueryResult,
+) -> Option<Arc<RowSet>> {
+    let raw_rows = result.into_csharp_raw_rows()?;
+    let iter = RawRowLendingIterator::new(raw_rows);
+    Some(Arc::new(RowSet::Materialized(std::sync::Mutex::new(iter))))
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn session_query_unpaged(
+    tcb: Tcb<ManuallyDestructible>,
+    session_ptr: BridgedBorrowedSharedPtr<'_, BridgedSession>,
+    statement: CSharpStr<'_>,
+    execution_options: SimpleStatementExecutionOptions,
+) {
+    let statement = statement.as_cstr().unwrap().to_str().unwrap().to_owned();
+    let session_arc = ArcFFI::cloned_from_ptr(session_ptr).unwrap();
+
+    tracing::trace!(
+        "[FFI] Scheduling unpaged statement for execution: \"{}\"",
+        statement
+    );
+
+    let session_guard_res = session_arc.try_read_owned();
+
+    BridgedFuture::spawn::<_, _, SessionOperationError<ExecutionError>, _>(tcb, async move {
+        tracing::debug!("[FFI] Executing unpaged statement \"{}\"", statement);
+
+        let Ok(session_guard) = session_guard_res else {
+            return Err(SessionOperationError::AlreadyShutdown);
+        };
+
+        let Some(session) = session_guard.session.as_ref() else {
+            return Err(SessionOperationError::AlreadyShutdown);
+        };
+
+        let mut stmt = Statement::new(statement);
+        stmt.set_is_idempotent(bool::from(execution_options.is_idempotent));
+
+        if bool::from(execution_options.has_consistency_level) {
+            let consistency = execution_options
+                .consistency_level
+                .try_into()
+                .map_err(|err| {
+                    SessionOperationError::InvalidArgument(format!(
+                        "Invalid consistency level value {0} passed from C# for unpaged simple query: {1}",
+                        execution_options.consistency_level, err
+                    ))
+                })?;
+            stmt.set_consistency(consistency);
+        } else {
+            stmt.unset_consistency();
+        }
+
+        let result = session
+            .query_unpaged(stmt, ())
+            .await
+            .map_err(SessionOperationError::Inner)?;
+
+        tracing::trace!("[FFI] Unpaged statement executed");
+
+        Ok(query_result_to_materialized_row_set(result))
+    });
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn session_query_with_values_unpaged(
+    tcb: Tcb<ManuallyDestructible>,
+    session_ptr: BridgedBorrowedSharedPtr<'_, BridgedSession>,
+    statement: CSharpStr<'_>,
+    populate_values_context: PopulateValuesContext<'_>,
+    populate_values: PopulateValues,
+    execution_options: SimpleStatementExecutionOptions,
+) {
+    let psv =
+        match PreSerializedValues::from_populate_callback(populate_values_context, populate_values)
+        {
+            Ok(v) => v,
+            Err(exception) => {
+                tcb.fail_task(exception);
+                return;
+            }
+        };
+
+    let statement = statement.as_cstr().unwrap().to_str().unwrap().to_owned();
+    let session_arc = ArcFFI::cloned_from_ptr(session_ptr).unwrap();
+
+    let session_guard_res = session_arc.try_read_owned();
+
+    BridgedFuture::spawn::<_, _, SessionOperationError<ExecutionError>, _>(tcb, async move {
+        tracing::debug!(
+            "[FFI] Preparing and executing unpaged statement with pre-serialized values \"{}\"",
+            statement
+        );
+
+        let Ok(session_guard) = session_guard_res else {
+            return Err(SessionOperationError::AlreadyShutdown);
+        };
+
+        let Some(session) = session_guard.session.as_ref() else {
+            return Err(SessionOperationError::AlreadyShutdown);
+        };
+
+        let mut prepared = session
+            .prepare(statement)
+            .await
+            .map_err(|e| SessionOperationError::Inner(ExecutionError::PrepareError(e)))?;
+
+        prepared.set_is_idempotent(bool::from(execution_options.is_idempotent));
+
+        if bool::from(execution_options.has_consistency_level) {
+            let consistency = execution_options
+                .consistency_level
+                .try_into()
+                .map_err(|err| {
+                    SessionOperationError::InvalidArgument(format!(
+                        "Invalid consistency level value {0} passed from C# for unpaged simple query with values: {1}",
+                        execution_options.consistency_level, err
+                    ))
+                })?;
+            prepared.set_consistency(consistency);
+        } else {
+            prepared.unset_consistency();
+        }
+
+        let serialized_values: SerializedValues = psv.into_serialized_values();
+
+        let result = session
+            .execute_unpaged_preserialized(&prepared, serialized_values)
+            .await
+            .map_err(SessionOperationError::Inner)?;
+
+        tracing::trace!("[FFI] Unpaged prepared statement executed with pre-serialized values");
+
+        Ok(query_result_to_materialized_row_set(result))
+    });
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn session_query_bound_unpaged(
+    tcb: Tcb<ManuallyDestructible>,
+    session_ptr: BridgedBorrowedSharedPtr<'_, BridgedSession>,
+    prepared_statement_ptr: BridgedBorrowedSharedPtr<'_, BridgedPreparedStatement>,
+    execution_options: BoundStatementExecutionOptions,
+) {
+    let bridged_prepared = ArcFFI::as_ref(prepared_statement_ptr).unwrap();
+    let session_arc = ArcFFI::cloned_from_ptr(session_ptr).unwrap();
+
+    tracing::trace!("[FFI] Scheduling unpaged prepared statement execution");
+
+    let session_guard_res = session_arc.try_read_owned();
+
+    let mut prepared_statement = bridged_prepared
+        .inner
+        .read()
+        .expect("poisoning impossible due to process-aborting panics")
+        .clone();
+
+    BridgedFuture::spawn::<_, _, SessionOperationError<ExecutionError>, _>(tcb, async move {
+        tracing::debug!("[FFI] Executing unpaged prepared statement");
+
+        let Ok(session_guard) = session_guard_res else {
+            return Err(SessionOperationError::AlreadyShutdown);
+        };
+
+        let Some(session) = session_guard.session.as_ref() else {
+            return Err(SessionOperationError::AlreadyShutdown);
+        };
+
+        if bool::from(execution_options.has_consistency_level) {
+            let consistency = execution_options
+                .consistency_level
+                .try_into()
+                .map_err(|err| {
+                    SessionOperationError::InvalidArgument(format!(
+                        "Invalid consistency level value {0} passed from C# for unpaged bound query: {1}",
+                        execution_options.consistency_level, err
+                    ))
+                })?;
+            prepared_statement.set_consistency(consistency);
+        } else {
+            prepared_statement.unset_consistency();
+        }
+
+        prepared_statement.set_is_idempotent(bool::from(execution_options.is_idempotent));
+
+        let result = session
+            .execute_unpaged(&prepared_statement, ())
+            .await
+            .map_err(SessionOperationError::Inner)?;
+
+        tracing::trace!("[FFI] Unpaged prepared statement executed");
+
+        Ok(query_result_to_materialized_row_set(result))
+    })
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn session_query_bound_with_values_unpaged(
+    tcb: Tcb<ManuallyDestructible>,
+    session_ptr: BridgedBorrowedSharedPtr<'_, BridgedSession>,
+    prepared_statement_ptr: BridgedBorrowedSharedPtr<'_, BridgedPreparedStatement>,
+    populate_values_context: PopulateValuesContext<'_>,
+    populate_values: PopulateValues,
+    execution_options: BoundStatementExecutionOptions,
+) {
+    let psv =
+        match PreSerializedValues::from_populate_callback(populate_values_context, populate_values)
+        {
+            Ok(v) => v,
+            Err(exception) => {
+                tcb.fail_task(exception);
+                return;
+            }
+        };
+
+    let bridged_prepared = ArcFFI::as_ref(prepared_statement_ptr).unwrap();
+    let session_arc = ArcFFI::cloned_from_ptr(session_ptr).unwrap();
+
+    tracing::trace!("[FFI] Scheduling unpaged prepared statement execution with values");
+
+    let session_guard_res = session_arc.try_read_owned();
+
+    let mut prepared_statement = bridged_prepared
+        .inner
+        .read()
+        .expect("poisoning impossible due to process-aborting panics")
+        .clone();
+
+    BridgedFuture::spawn::<_, _, SessionOperationError<ExecutionError>, _>(tcb, async move {
+        tracing::debug!("[FFI] Executing unpaged prepared statement with values");
+
+        let Ok(session_guard) = session_guard_res else {
+            return Err(SessionOperationError::AlreadyShutdown);
+        };
+
+        let Some(session) = session_guard.session.as_ref() else {
+            return Err(SessionOperationError::AlreadyShutdown);
+        };
+
+        if bool::from(execution_options.has_consistency_level) {
+            let consistency = execution_options
+                .consistency_level
+                .try_into()
+                .map_err(|err| {
+                    SessionOperationError::InvalidArgument(format!(
+                        "Invalid consistency level value {0} passed from C# for unpaged bound query with values: {1}",
+                        execution_options.consistency_level,
+                        err
+                    ))
+                })?;
+            prepared_statement.set_consistency(consistency);
+        } else {
+            prepared_statement.unset_consistency();
+        }
+
+        prepared_statement.set_is_idempotent(bool::from(execution_options.is_idempotent));
+
+        let serialized_values: SerializedValues = psv.into_serialized_values();
+
+        let result = session
+            .execute_unpaged_preserialized(&prepared_statement, serialized_values)
+            .await
+            .map_err(SessionOperationError::Inner)?;
+
+        tracing::trace!("[FFI] Unpaged prepared statement executed with values");
+
+        Ok(query_result_to_materialized_row_set(result))
+    });
+}
+
+/// Executes a batch that was assembled by C# via `batch_create` / `batch_append_*`.
+///
+/// Returns the batch result as a materialized `RowSet` (for conditional/LWT
+/// batches that include an `[applied]` row) or `None` for regular batches.
+#[unsafe(no_mangle)]
+pub extern "C" fn session_batch(
+    tcb: Tcb<ManuallyDestructible>,
+    session_ptr: BridgedBorrowedSharedPtr<'_, BridgedSession>,
+    batch_ptr: BridgedBorrowedSharedPtr<'_, BridgedBatch>,
+) {
+    let session_arc = ArcFFI::cloned_from_ptr(session_ptr).unwrap();
+    let batch_arc = ArcFFI::cloned_from_ptr(batch_ptr).unwrap();
+
+    tracing::trace!("[FFI] Scheduling batch execution");
+
+    // Try to acquire an owned read lock.
+    // If the operation fails, treat it as session shutting down.
+    let session_guard_res = session_arc.try_read_owned();
+
+    BridgedFuture::spawn::<_, _, SessionOperationError<ExecutionError>, _>(tcb, async move {
+        tracing::debug!("[FFI] Executing batch");
+
+        let Ok(session_guard) = session_guard_res else {
+            // Session is currently shutting down - exit with appropriate error.
+            return Err(SessionOperationError::AlreadyShutdown);
+        };
+
+        // Check if session is connected or if it has been shut down.
+        // If it has been shut down, return appropriate error.
+        let Some(session) = session_guard.session.as_ref() else {
+            return Err(SessionOperationError::AlreadyShutdown);
+        };
+
+        // Clone the assembled batch and its values out of the shared handle so
+        // they can be moved into (and outlive) this async task.
+        let (batch, values) = {
+            let guard = batch_arc
+                .inner
+                .lock()
+                .expect("poisoning impossible due to process-aborting panics");
+            (guard.batch.clone(), guard.values.clone())
+        };
+
+        let result = session
+            .batch_preserialized(&batch, &values)
+            .await
+            .map_err(SessionOperationError::Inner)?;
+
+        tracing::trace!("[FFI] Batch executed");
+
+        Ok(query_result_to_materialized_row_set(result))
     });
 }
 

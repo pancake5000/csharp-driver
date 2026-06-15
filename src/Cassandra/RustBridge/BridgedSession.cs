@@ -70,6 +70,30 @@ namespace Cassandra
             PreparedStatementExecutionOptions executionOptions);
 
         [DllImport(NativeLibrary.CSharpWrapper, CallingConvention = CallingConvention.Cdecl)]
+        unsafe private static extern void session_query_unpaged(Tcb<ManuallyDestructible> tcb, IntPtr session, [MarshalAs(UnmanagedType.LPUTF8Str)] string statement, SimpleStatementExecutionOptions executionOptions);
+
+        [DllImport(NativeLibrary.CSharpWrapper, CallingConvention = CallingConvention.Cdecl)]
+        unsafe private static extern void session_query_with_values_unpaged(Tcb<ManuallyDestructible> tcb, IntPtr session, [MarshalAs(UnmanagedType.LPUTF8Str)] string statement, IntPtr populateValuesContext, IntPtr populateValuesCallback, SimpleStatementExecutionOptions executionOptions);
+
+        [DllImport(NativeLibrary.CSharpWrapper, CallingConvention = CallingConvention.Cdecl)]
+        unsafe private static extern void session_query_bound_unpaged(
+            Tcb<ManuallyDestructible> tcb,
+            IntPtr session,
+            IntPtr preparedStatement,
+            PreparedStatementExecutionOptions executionOptions);
+
+        [DllImport(NativeLibrary.CSharpWrapper, CallingConvention = CallingConvention.Cdecl)]
+        unsafe private static extern void session_query_bound_with_values_unpaged(
+            Tcb<ManuallyDestructible> tcb,
+            IntPtr session,
+            IntPtr preparedStatement,
+            IntPtr populateValuesContext, IntPtr populateValuesCallback,
+            PreparedStatementExecutionOptions executionOptions);
+
+        [DllImport(NativeLibrary.CSharpWrapper, CallingConvention = CallingConvention.Cdecl)]
+        unsafe private static extern void session_batch(Tcb<ManuallyDestructible> tcb, IntPtr session, IntPtr batch);
+
+        [DllImport(NativeLibrary.CSharpWrapper, CallingConvention = CallingConvention.Cdecl)]
         unsafe private static extern FFIMaybeException session_get_keyspace(IntPtr session, IntPtr writeToStr, IntPtr context, IntPtr constructorsPtr);
 
         /// <summary>
@@ -235,6 +259,89 @@ namespace Cassandra
                     (IntPtr)SerializationHandler.PopulateValuesPtr,
                     executionOptions));
             GC.KeepAlive(populateCtx);
+            return task;
+        }
+
+        internal Task<ManuallyDestructible> QueryUnpaged(
+            string statement,
+            bool hasConsistencyLevel,
+            ushort consistencyLevel,
+            bool isIdempotent)
+        {
+            var executionOptions = new SimpleStatementExecutionOptions(
+                hasConsistencyLevel, consistencyLevel, isIdempotent, 0);
+            return RunAsyncWithIncrement<ManuallyDestructible>((tcb, ptr) => session_query_unpaged(tcb, ptr, statement, executionOptions));
+        }
+
+        internal unsafe Task<ManuallyDestructible> QueryWithValuesUnpaged(
+            string statement,
+            object[] queryValues,
+            ISerializer serializer,
+            bool hasConsistencyLevel,
+            ushort consistencyLevel,
+            bool isIdempotent)
+        {
+            var populateCtx = SerializationHandler.CreateContext(queryValues, serializer);
+            var ctxIntPtr = (IntPtr)Unsafe.AsPointer(ref populateCtx);
+            var executionOptions = new SimpleStatementExecutionOptions(
+                hasConsistencyLevel, consistencyLevel, isIdempotent, 0);
+            var task = RunAsyncWithIncrement<ManuallyDestructible>((tcb, ptr) =>
+                session_query_with_values_unpaged(
+                    tcb, ptr, statement,
+                    ctxIntPtr,
+                    (IntPtr)SerializationHandler.PopulateValuesPtr,
+                    executionOptions));
+            GC.KeepAlive(populateCtx);
+            return task;
+        }
+
+        internal Task<ManuallyDestructible> QueryBoundUnpaged(
+            IntPtr preparedStatement,
+            bool hasConsistencyLevel,
+            ushort consistencyLevel,
+            bool isIdempotent)
+        {
+            var executionOptions = new PreparedStatementExecutionOptions(
+                hasConsistencyLevel, consistencyLevel, isIdempotent, 0);
+            return RunAsyncWithIncrement<ManuallyDestructible>((tcb, ptr) => session_query_bound_unpaged(
+                tcb, ptr, preparedStatement, executionOptions));
+        }
+
+        internal unsafe Task<ManuallyDestructible> QueryBoundWithValuesUnpaged(
+            IntPtr preparedStatement,
+            object[] queryValues,
+            ISerializer serializer,
+            bool hasConsistencyLevel,
+            ushort consistencyLevel,
+            bool isIdempotent)
+        {
+            var populateCtx = SerializationHandler.CreateContext(queryValues, serializer);
+            var ctxIntPtr = (IntPtr)Unsafe.AsPointer(ref populateCtx);
+            var executionOptions = new PreparedStatementExecutionOptions(
+                hasConsistencyLevel, consistencyLevel, isIdempotent, 0);
+            var task = RunAsyncWithIncrement<ManuallyDestructible>((tcb, ptr) =>
+                session_query_bound_with_values_unpaged(
+                    tcb, ptr, preparedStatement,
+                    ctxIntPtr,
+                    (IntPtr)SerializationHandler.PopulateValuesPtr,
+                    executionOptions));
+            GC.KeepAlive(populateCtx);
+            return task;
+        }
+
+        /// <summary>
+        /// Executes a batch that was assembled via <see cref="BridgedBatch"/>.
+        /// Batches return no rows, so the completed task yields an empty result
+        /// resource that the caller disposes.
+        /// </summary>
+        /// <param name="batch">The assembled batch to execute.</param>
+        internal Task<ManuallyDestructible> Batch(BridgedBatch batch)
+        {
+            // session_batch clones the batch's Arc synchronously before spawning, so the
+            // batch handle only needs to stay valid for the duration of the native call.
+            IntPtr batchHandle = batch.DangerousGetHandle();
+            var task = RunAsyncWithIncrement<ManuallyDestructible>((tcb, ptr) => session_batch(tcb, ptr, batchHandle));
+            GC.KeepAlive(batch);
             return task;
         }
 
